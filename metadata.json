@@ -1,0 +1,5 @@
+{
+  "name": "ComfyUI 提示词助手",
+  "description": "一个用于 ComfyUI 的 AI 提示词辅助工具，支持中英文混合输入、智能分类、Tag 管理和语法高亮。",
+  "requestFramePermissions": []
+}
