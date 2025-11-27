@@ -3,7 +3,7 @@ import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages } from 'lucide-react';
 import { parseSegmentsWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
-import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType } from './types';
+import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE } from './types';
 import TagItem from './components/TagItem';
 import CategorySettings from './components/CategorySettings';
 
@@ -16,20 +16,67 @@ const App: React.FC = () => {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [categories, setCategories] = useState<CategoryDef[]>(DEFAULT_CATEGORIES);
   const [showTranslation, setShowTranslation] = useState<boolean>(true);
+  
+  // AI Config State
+  const [aiConfig, setAiConfig] = useState<AIConfig>(() => {
+    const saved = localStorage.getItem('comfyui_ai_config');
+    return saved ? JSON.parse(saved) : DEFAULT_AI_CONFIG;
+  });
+
+  // Shortcut Config State
+  const [shortcuts, setShortcuts] = useState<ShortcutConfig>(() => {
+    const saved = localStorage.getItem('comfyui_shortcuts');
+    return saved ? JSON.parse(saved) : DEFAULT_SHORTCUTS;
+  });
+
+  // Persist Configs
+  useEffect(() => {
+    localStorage.setItem('comfyui_ai_config', JSON.stringify(aiConfig));
+  }, [aiConfig]);
+
+  useEffect(() => {
+    localStorage.setItem('comfyui_shortcuts', JSON.stringify(shortcuts));
+  }, [shortcuts]);
 
   // Interaction State
   const [hoveredTagIndex, setHoveredTagIndex] = useState<number | null>(null);
+  const [isInteractionMode, setIsInteractionMode] = useState<boolean>(false);
+  const [tooltip, setTooltip] = useState<{ x: number, y: number, tag: PromptTag } | null>(null);
 
-  // Cache: Maps RAW segment text -> Parsed Tag Data (without unique ID)
-  // This is a session memory cache for exact string matches including syntax
+  // Cache: Maps RAW segment text -> Parsed Tag Data
   const tagCache = useRef<Map<string, Omit<PromptTag, 'id'>>>(new Map());
 
-  // Refs for Drag & Drop and Input Sync
+  // Refs
   const isUpdatingFromTags = useRef(false);
   const dragItem = useRef<number | null>(null);
-  
-  // Refs for Highlight Sync
   const backdropRef = useRef<HTMLDivElement>(null);
+
+  // Global Key Listeners for Interaction Mode (Ctrl/Meta Press)
+  useEffect(() => {
+    const handleKeyChange = (e: KeyboardEvent) => {
+      // Toggle interaction mode based on the configured key
+      if (e.key === shortcuts.interactionKey) {
+        setIsInteractionMode(e.type === 'keydown');
+        if (e.type === 'keyup') setTooltip(null);
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyChange);
+    window.addEventListener('keyup', handleKeyChange);
+    
+    // Safety cleanup if window loses focus
+    const handleBlur = () => {
+        setIsInteractionMode(false);
+        setTooltip(null);
+    };
+    window.addEventListener('blur', handleBlur);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyChange);
+      window.removeEventListener('keyup', handleKeyChange);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [shortcuts]);
 
   // Helper: Split input string into segments
   const splitInputToSegments = (text: string): string[] => {
@@ -39,7 +86,7 @@ const App: React.FC = () => {
   // Helper: Generate a unique ID
   const generateId = () => `tag-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-  // Helper: Detect Syntax Type locally to aid Dictionary Lookup
+  // Helper: Detect Syntax Type locally
   const detectSyntax = (text: string): SyntaxType => {
     if (text.startsWith('<') && text.endsWith('>')) return SyntaxType.LORA;
     if (text.startsWith('{') && text.endsWith('}')) return SyntaxType.DYNAMIC;
@@ -47,16 +94,10 @@ const App: React.FC = () => {
     return SyntaxType.NORMAL;
   };
 
-  // Helper: Clean text for dictionary lookup (remove weights/brackets)
+  // Helper: Clean text for dictionary lookup
   const cleanTextForLookup = (text: string): string => {
-    // Remove ( ), [ ], { }, < > and weights like :1.2
-    // Simple heuristic: just look at the core word if possible. 
-    // For "1girl", it's "1girl". For "(1girl:1.2)", we want "1girl".
-    // Regex to strip outer brackets and potential weight
     let cleaned = text;
-    // Strip weighting syntax like (text:1.2) or [text]
     cleaned = cleaned.replace(/^[\(\[\{<]+|[\)\]\}>]+$/g, '');
-    // Remove weight part if exists (e.g. :1.2)
     cleaned = cleaned.split(':')[0];
     return cleaned.trim();
   };
@@ -75,37 +116,31 @@ const App: React.FC = () => {
 
     // 1. First Pass: Resolve from Cache OR Dictionary
     rawSegments.forEach((segment, index) => {
-      // A. Check Session Cache (Exact match including syntax)
       const cached = tagCache.current.get(segment);
       if (cached) {
         newTags[index] = { ...cached, id: generateId() };
         return;
       }
 
-      // B. Check Dictionary (Fuzzy match on core content)
-      // We need to parse syntax first so we don't mess up the visual type
       const syntax = detectSyntax(segment);
       const coreText = cleanTextForLookup(segment);
       const dictEntry = dictionaryService.lookup(coreText);
 
       if (dictEntry) {
-        // Found in dictionary!
         const tagData: Omit<PromptTag, 'id'> = {
           originalText: segment,
-          englishText: dictEntry.translation === coreText ? segment : coreText, // Use core text as english base
+          englishText: dictEntry.translation === coreText ? segment : coreText,
           translation: dictEntry.translation,
           category: dictEntry.category,
-          syntaxType: syntax, // Use detected syntax (e.g. weighted), not dictionary syntax (usually normal)
+          syntaxType: syntax,
           raw: segment,
           disabled: false,
           isRefreshing: false
         };
         
-        // Add to cache so we don't lookup again this session
         tagCache.current.set(segment, tagData);
         newTags[index] = { ...tagData, id: generateId() };
       } else {
-        // C. Not found anywhere -> Mark for AI
         missingSegments.push(segment);
         missingSegmentIndices.push(index);
         newTags[index] = {
@@ -128,9 +163,7 @@ const App: React.FC = () => {
       const uniqueMissing = Array.from(new Set(missingSegments));
       
       try {
-        const results = await parseSegmentsWithGemini(uniqueMissing, categories);
-        
-        // 3. Process Results & Learn
+        const results = await parseSegmentsWithGemini(uniqueMissing, categories, aiConfig);
         const tagsToLearn: PromptTag[] = [];
 
         results.forEach(res => {
@@ -141,21 +174,15 @@ const App: React.FC = () => {
             category: res.category,
             syntaxType: res.syntaxType,
             raw: res.raw,
-            disabled: false // Default to enabled
+            disabled: false 
           };
 
-          // Update Session Cache
           tagCache.current.set(res.raw, tagData);
-          
-          // Queue for Dictionary Learning
-          // We cast to PromptTag (with fake ID) for the learn function
           tagsToLearn.push({ ...tagData, id: 'temp' });
         });
         
-        // Trigger Learning
         dictionaryService.learnBatch(tagsToLearn);
 
-        // Update UI
         const updatedTags = [...newTags];
         missingSegmentIndices.forEach(index => {
           const segmentRaw = rawSegments[index];
@@ -163,7 +190,6 @@ const App: React.FC = () => {
           if (cached) {
             updatedTags[index] = { ...cached, id: updatedTags[index].id, isRefreshing: false };
           } else {
-             // Fallback if AI somehow didn't return this specific segment (rare)
              updatedTags[index] = { ...updatedTags[index], isRefreshing: false, category: 'Unknown' };
           }
         });
@@ -175,9 +201,9 @@ const App: React.FC = () => {
         setTags(prev => prev.map(t => ({ ...t, isRefreshing: false })));
       }
     }
-  }, [categories]);
+  }, [categories, aiConfig]);
 
-  // Debounce Effect for Input Typing
+  // Debounce Input
   useEffect(() => {
     if (isUpdatingFromTags.current) {
       isUpdatingFromTags.current = false;
@@ -190,36 +216,28 @@ const App: React.FC = () => {
   }, [input, processInput]);
 
 
-  // Handle Tag Removal (Reverse Sync)
   const handleRemoveTag = (id: string) => {
     const newTags = tags.filter(t => t.id !== id);
     setTags(newTags);
     updateInputFromTags(newTags);
   };
 
-  // Handle Tag Toggle (Disable/Enable)
   const handleToggleTag = (tag: PromptTag) => {
     const newStatus = !tag.disabled;
-    
-    // Update State
     setTags(prev => prev.map(t => t.id === tag.id ? { ...t, disabled: newStatus } : t));
-    
-    // Update Cache so it persists if we re-parse (optional, but good UX for typing)
     const cached = tagCache.current.get(tag.raw);
     if (cached) {
       tagCache.current.set(tag.raw, { ...cached, disabled: newStatus });
     }
   };
 
-  // Handle Tag Reload
   const handleReloadTag = async (tagToReload: PromptTag) => {
     setTags(prev => prev.map(t => t.id === tagToReload.id ? { ...t, isRefreshing: true } : t));
     tagCache.current.delete(tagToReload.raw);
 
     try {
-      const [result] = await parseSegmentsWithGemini([tagToReload.raw], categories);
+      const [result] = await parseSegmentsWithGemini([tagToReload.raw], categories, aiConfig);
       if (result) {
-        // Update Cache
         tagCache.current.set(result.raw, {
             originalText: result.originalText,
             englishText: result.englishText,
@@ -227,12 +245,9 @@ const App: React.FC = () => {
             category: result.category,
             syntaxType: result.syntaxType,
             raw: result.raw,
-            disabled: tagToReload.disabled // Preserve disabled state
+            disabled: tagToReload.disabled
         });
-
-        // Update Dictionary (Re-learning logic)
         dictionaryService.learn({ ...result, id: 'temp' });
-
         setTags(prev => prev.map(t => t.id === tagToReload.id ? { ...result, id: t.id, isRefreshing: false } : t));
       }
     } catch (e) {
@@ -241,7 +256,6 @@ const App: React.FC = () => {
     }
   };
 
-  // Handle Drag Reorder
   const handleDragStart = (e: React.DragEvent, index: number) => {
     dragItem.current = index;
     e.dataTransfer.effectAllowed = 'move';
@@ -277,7 +291,6 @@ const App: React.FC = () => {
   };
 
   const copyToClipboard = () => {
-    // Only copy enabled tags
     const activeTags = tags.filter(t => !t.disabled);
     if (!activeTags.length) return;
     
@@ -292,7 +305,6 @@ const App: React.FC = () => {
     return cat ? cat.color : 'slate';
   };
 
-  // Sync Scroll for Highlighter
   const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     if (backdropRef.current) {
       backdropRef.current.scrollTop = e.currentTarget.scrollTop;
@@ -300,30 +312,114 @@ const App: React.FC = () => {
     }
   };
 
-  // Highlighter Logic
+  // --- Shortcut & Interaction Logic ---
+
+  // Helper: map string position to tags based on delimiters
+  const getTagRanges = (inputText: string) => {
+    const ranges: {index: number, start: number, end: number}[] = [];
+    // Must match the logic in splitInputToSegments exactly
+    const parts = inputText.split(/([,，\n]+)/);
+    let currentPos = 0;
+    let tagIdx = 0;
+    
+    parts.forEach(part => {
+        const isDelimiter = part.match(/^[,，\n]+$/);
+        const len = part.length;
+        if (!isDelimiter && part.trim().length > 0) {
+            // Found a valid tag segment
+            ranges.push({
+                index: tagIdx,
+                start: currentPos,
+                end: currentPos + len
+            });
+            tagIdx++;
+        }
+        currentPos += len;
+    });
+    return ranges;
+  };
+
+  const handleTextAreaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const isModifier = shortcuts.interactionKey === 'Meta' ? e.metaKey : e.ctrlKey;
+    
+    // Toggle Strikethrough
+    if (isModifier && e.key === shortcuts.toggleDisableKey) {
+        e.preventDefault();
+        const textarea = e.currentTarget;
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        const ranges = getTagRanges(input);
+        
+        const idsToToggle = new Set<string>();
+        
+        if (start === end) {
+            // Cursor Mode: Find tag that strictly contains the cursor
+            // Note: If cursor is at the exact boundary of two tags (e.g., "tag1|tag2"), logic favors the one it's "in".
+            const target = ranges.find(r => start >= r.start && start <= r.end);
+            if (target && tags[target.index]) {
+                idsToToggle.add(tags[target.index].id);
+            }
+        } else {
+            // Selection Mode: Find tags that overlap with the selection
+            // Overlap logic: (RangeStart < SelEnd) && (RangeEnd > SelStart)
+            ranges.forEach(r => {
+                if (r.start < end && r.end > start) {
+                     if (tags[r.index]) idsToToggle.add(tags[r.index].id);
+                }
+            });
+        }
+        
+        if (idsToToggle.size > 0) {
+            const newTags = tags.map(t => idsToToggle.has(t.id) ? { ...t, disabled: !t.disabled } : t);
+            setTags(newTags);
+            // Update cache
+            newTags.forEach(t => {
+                if (idsToToggle.has(t.id)) {
+                    const cached = tagCache.current.get(t.raw);
+                    if (cached) tagCache.current.set(t.raw, { ...cached, disabled: t.disabled });
+                }
+            });
+        }
+    }
+  };
+
+  const handleSegmentHover = (e: React.MouseEvent, tagIndex: number) => {
+      // Only show tooltip in interaction mode
+      if (!isInteractionMode) return;
+      const tag = tags[tagIndex];
+      if (!tag) return;
+      
+      const rect = (e.target as HTMLElement).getBoundingClientRect();
+      // Calculate position relative to viewport
+      setTooltip({
+          x: rect.left + rect.width / 2,
+          y: rect.bottom + 8, // slight offset
+          tag: tag
+      });
+  };
+
   const highlightInput = (text: string) => {
     if (!text) return null;
     
-    // Split by commas/newlines but keep delimiters to render them
     const segmentsAndDelimiters = text.split(/([,，\n]+)/);
     let tagIndexCounter = 0;
 
     return segmentsAndDelimiters.map((part, i) => {
-        // Render Delimiters
         if (part.match(/^[,，\n]+$/)) {
             return <span key={i} className="text-amber-500/70 font-bold">{part}</span>;
         }
         
-        // Handle empty/whitespace parts (usually between adjacent delimiters)
         if (!part.trim()) {
            return <span key={i}>{part}</span>;
         }
 
-        // Current Tag Logic
         const currentTagIndex = tagIndexCounter++;
         const tagState = tags[currentTagIndex];
         const isDisabled = tagState?.disabled;
         const isHovered = hoveredTagIndex === currentTagIndex;
+        
+        // In Interaction Mode, highlight tags that are hoverable
+        const interactionClass = isInteractionMode ? 'hover:bg-indigo-900/40 hover:outline hover:outline-1 hover:outline-indigo-500/50 cursor-help rounded-[2px]' : '';
 
         const innerContent = (() => {
            const regex = /(\<[^>]+?\>|\{[^}]+?\}|\([^)]+?\)|\[[^\]]+?\])/g;
@@ -332,33 +428,67 @@ const App: React.FC = () => {
            return subParts.map((sub, j) => {
               if (!sub) return null;
               let colorClass = 'text-gray-300';
-              
               if (sub.startsWith('<') && sub.endsWith('>')) colorClass = 'text-rose-400 font-bold';
               else if (sub.startsWith('{') && sub.endsWith('}')) colorClass = 'text-cyan-400 font-bold';
               else if (sub.startsWith('(') && sub.endsWith(')')) colorClass = 'text-amber-400 font-bold';
               else if (sub.startsWith('[') && sub.endsWith(']')) colorClass = 'text-indigo-400 font-bold';
-
               return <span key={`${i}-${j}`} className={colorClass}>{sub}</span>
            });
         })();
 
-        // Hover Effect Class - Enhanced Visibility
         const hoverClass = isHovered 
             ? 'bg-indigo-600/50 ring-2 ring-indigo-400 text-white font-bold shadow-[0_0_12px_rgba(99,102,241,0.5)] z-10 rounded-sm box-decoration-clone' 
             : '';
         const disabledClass = isDisabled ? 'line-through text-gray-600 decoration-gray-500 opacity-60' : '';
 
         return (
-            <span key={i} className={`${hoverClass} ${disabledClass} transition-all duration-150`}>
+            <span 
+                key={i} 
+                onMouseEnter={(e) => handleSegmentHover(e, currentTagIndex)}
+                onMouseLeave={() => setTooltip(null)}
+                className={`${hoverClass} ${disabledClass} ${interactionClass} transition-all duration-150 inline-block`}
+            >
                 {innerContent}
             </span>
         );
     });
   };
 
+  // Tooltip Component
+  const TagDetailTooltip = () => {
+    if (!tooltip) return null;
+    const { x, y, tag } = tooltip;
+    
+    // Resolve Color
+    const cat = categories.find(c => c.name === tag.category);
+    const colorVal = COLOR_PALETTE.find(c => c.name === (cat?.color || 'slate'))?.value;
+
+    return (
+        <div 
+            className="fixed z-[100] transform -translate-x-1/2 pointer-events-none animate-in fade-in zoom-in-95 duration-150"
+            style={{ left: x, top: y }}
+        >
+            <div className={`
+                flex flex-col gap-1 p-2 rounded-lg shadow-xl border backdrop-blur-md
+                ${colorVal ? colorVal.replace('/40', '/90') : 'bg-gray-800/90 border-gray-700 text-gray-200'}
+            `}>
+                 <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-1 mb-0.5">
+                    <span className="text-[10px] uppercase font-bold opacity-80">{tag.category}</span>
+                    <span className="text-[10px] font-mono opacity-60">{tag.syntaxType}</span>
+                 </div>
+                 <div className="font-bold text-sm">{tag.englishText}</div>
+                 {tag.translation && tag.translation !== tag.englishText && (
+                    <div className="text-xs opacity-90">{tag.translation}</div>
+                 )}
+            </div>
+        </div>
+    );
+  };
+
   return (
     <div className="min-h-screen p-4 md:p-6 lg:p-8 max-w-7xl mx-auto flex flex-col gap-5 text-gray-200 font-sans">
-      
+      <TagDetailTooltip />
+
       {/* Header */}
       <header className="flex items-center justify-between pb-4 border-b border-gray-800/50">
         <div className="flex items-center gap-3">
@@ -375,7 +505,7 @@ const App: React.FC = () => {
         <button 
           onClick={() => setShowSettings(true)}
           className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-full transition-all"
-          title="分类与词库设置"
+          title="设置 (Settings)"
         >
           <Settings size={20} />
         </button>
@@ -390,38 +520,42 @@ const App: React.FC = () => {
             <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">原始输入 (Raw Input)</h2>
             <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
               <Info size={10} />
-              划线为已禁用
+              {isInteractionMode ? '交互模式: 悬浮查看详情' : `按住 ${shortcuts.interactionKey} 悬浮 · ${shortcuts.interactionKey}+${shortcuts.toggleDisableKey} 禁用`}
             </div>
           </div>
           
           <div className="relative flex-grow min-h-[250px] lg:min-h-[500px] bg-gray-900/50 rounded-xl border border-gray-700/50 focus-within:border-indigo-500/50 focus-within:ring-1 focus-within:ring-indigo-500/20 transition-all shadow-inner overflow-hidden group">
             
-            {/* Highlighter Backdrop */}
+            {/* Highlighter Backdrop - becomes INTERACTIVE layer when InteractionMode is ON */}
             <div 
                 ref={backdropRef}
-                className="absolute inset-0 p-4 font-mono text-sm leading-relaxed pointer-events-none overflow-hidden whitespace-pre-wrap break-words"
+                className={`
+                    absolute inset-0 p-4 font-mono text-sm leading-relaxed overflow-hidden whitespace-pre-wrap break-words
+                    ${isInteractionMode ? 'pointer-events-auto z-20' : 'pointer-events-none z-0'}
+                `}
                 aria-hidden="true"
             >
                 {highlightInput(input)}
             </div>
 
-            {/* Actual Input */}
+            {/* Actual Input - becomes INACTIVE when InteractionMode is ON */}
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onScroll={handleScroll}
+              onKeyDown={handleTextAreaKeyDown}
               spellCheck={false}
-              placeholder="在这里输入提示词，逗号分隔...
-例如: 1girl, red dress, (masterpiece:1.2), <lora:style:0.8>, {dynamic_prompt}"
+              placeholder="在这里输入提示词，逗号分隔..."
               className={`
-                relative z-10 w-full h-full bg-transparent p-4 resize-none outline-none font-mono text-sm leading-relaxed caret-white custom-scrollbar
+                relative w-full h-full bg-transparent p-4 resize-none outline-none font-mono text-sm leading-relaxed caret-white custom-scrollbar
                 ${input ? 'text-transparent' : 'text-gray-300'} 
+                ${isInteractionMode ? 'pointer-events-none z-0' : 'pointer-events-auto z-10'}
                 placeholder-gray-600
               `}
             />
             
             {/* Floating Actions */}
-            <div className="absolute bottom-3 right-3 flex gap-2 z-20">
+            <div className="absolute bottom-3 right-3 flex gap-2 z-30 pointer-events-auto">
               <button
                 onClick={handleClear}
                 className="p-2 text-gray-500 hover:text-red-400 hover:bg-gray-800 rounded-lg transition-colors"
@@ -438,7 +572,6 @@ const App: React.FC = () => {
            <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">结构化标签 (Structured Tags)</h2>
             <div className="flex items-center gap-2">
-              {/* Language Toggle */}
               <button 
                 onClick={() => setShowTranslation(!showTranslation)}
                 className={`p-1.5 rounded-full transition-colors ${showTranslation ? 'text-indigo-400 bg-indigo-900/30' : 'text-gray-500 hover:text-gray-300'}`}
@@ -471,7 +604,6 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex-grow min-h-[300px] bg-gray-950 rounded-xl border border-gray-800 p-4 relative shadow-inner flex flex-col">
-            
             {tags.length === 0 ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-700 gap-3 select-none">
                 <div className="w-12 h-12 rounded-full bg-gray-900 flex items-center justify-center border border-gray-800">
@@ -525,7 +657,11 @@ const App: React.FC = () => {
         <CategorySettings 
           categories={categories} 
           setCategories={setCategories} 
-          onClose={() => setShowSettings(false)} 
+          onClose={() => setShowSettings(false)}
+          aiConfig={aiConfig}
+          setAiConfig={setAiConfig}
+          shortcuts={shortcuts}
+          setShortcuts={setShortcuts}
         />
       )}
     </div>

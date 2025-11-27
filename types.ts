@@ -35,6 +35,30 @@ export interface DictionaryEntry {
   syntaxType?: SyntaxType;
 }
 
+export interface AIConfig {
+  useCustom: boolean;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+export const DEFAULT_AI_CONFIG: AIConfig = {
+  useCustom: false,
+  apiKey: '',
+  baseUrl: 'https://api.siliconflow.cn/v1',
+  model: 'deepseek-ai/DeepSeek-V2.5'
+};
+
+export interface ShortcutConfig {
+  toggleDisableKey: string; // e.g., '/'
+  interactionKey: 'Control' | 'Meta' | 'Alt'; // Main modifier
+}
+
+export const DEFAULT_SHORTCUTS: ShortcutConfig = {
+  toggleDisableKey: '/',
+  interactionKey: 'Control'
+};
+
 export type DictionaryMap = Record<string, DictionaryEntry>;
 
 export const COLOR_PALETTE = [
