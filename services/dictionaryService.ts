@@ -29,14 +29,9 @@ class DictionaryService {
 
   /**
    * Saves the current learned additions to LocalStorage.
-   * We only save what is NOT in the seed dictionary to save space, 
-   * or we can just save the delta. For simplicity, we'll save the whole learned set.
    */
   private saveToStorage() {
     try {
-      // We only want to save entries that differ from SEED or are new
-      // But for performance/simplicity in this demo, let's just dump the "learned" parts.
-      // A better approach: distinct keys.
       const learnedKeys = Object.keys(this.dictionary).filter(k => !SEED_DICTIONARY[k]);
       const learnedMap: DictionaryMap = {};
       learnedKeys.forEach(k => learnedMap[k] = this.dictionary[k]);
@@ -57,6 +52,48 @@ class DictionaryService {
   }
 
   /**
+   * Fuzzy Search for Autocomplete
+   */
+  public search(query: string, limit: number = 20): Array<{ key: string } & DictionaryEntry> {
+    const q = query.toLowerCase().trim();
+    if (!q) return [];
+
+    const results: Array<{ key: string; score: number } & DictionaryEntry> = [];
+
+    Object.entries(this.dictionary).forEach(([key, entry]) => {
+      let score = 0;
+      const keyLower = key.toLowerCase();
+      const transLower = entry.translation.toLowerCase();
+
+      // Matching Logic & Scoring
+      if (keyLower === q || transLower === q) {
+        score = 100; // Exact match
+      } else if (keyLower.startsWith(q)) {
+        score = 80; // Starts with English
+      } else if (transLower.startsWith(q)) {
+        score = 70; // Starts with Chinese
+      } else if (keyLower.includes(q)) {
+        score = 50; // Contains English
+      } else if (transLower.includes(q)) {
+        score = 40; // Contains Chinese
+      }
+
+      if (score > 0) {
+        results.push({ key, score, ...entry });
+      }
+    });
+
+    // Sort by score (desc) then by length (asc) for shorter matches first
+    return results
+      .sort((a, b) => {
+        if (a.score !== b.score) return b.score - a.score;
+        return a.key.length - b.key.length;
+      })
+      .slice(0, limit)
+      .map(({ score, ...rest }) => rest);
+  }
+
+  /**
    * Learn a new tag from AI results.
    */
   public learn(tag: PromptTag) {
@@ -64,17 +101,13 @@ class DictionaryService {
     
     const normalized = tag.englishText.toLowerCase().trim();
     
-    // Don't overwrite if it exists in SEED (Seed is trusted source),
-    // unless we want to allow AI to improve it. Let's trust SEED more.
     if (SEED_DICTIONARY[normalized]) return;
 
-    // Check if we already know it and it matches
     const existing = this.dictionary[normalized];
     if (existing && existing.category === tag.category && existing.translation === tag.translation) {
       return;
     }
 
-    // Add to dictionary
     this.dictionary[normalized] = {
       translation: tag.translation,
       category: tag.category,
@@ -93,9 +126,6 @@ class DictionaryService {
         const normalized = tag.englishText.toLowerCase().trim();
         if (SEED_DICTIONARY[normalized]) return;
         
-        // Skip learning LoRA or dynamic prompts usually as they are too specific,
-        // but user might want them. Let's store them.
-        
         const existing = this.dictionary[normalized];
         if (!existing) {
             this.dictionary[normalized] = {
@@ -112,16 +142,10 @@ class DictionaryService {
     }
   }
 
-  /**
-   * Export the full dictionary (Seed + Learned) as JSON string
-   */
   public exportJson(): string {
     return JSON.stringify(this.dictionary, null, 2);
   }
 
-  /**
-   * Clear learned data
-   */
   public clearLearned() {
     localStorage.removeItem(STORAGE_KEY);
     this.dictionary = { ...SEED_DICTIONARY };

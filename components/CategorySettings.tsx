@@ -254,26 +254,7 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
                         快捷键有助于快速编辑和检查提示词。设置的快捷键会自动保存。
                    </div>
                    
-                   <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                             <label className="text-[10px] text-gray-500 uppercase font-bold block">主要修饰键 (Modifier)</label>
-                             <div className="flex flex-col gap-2">
-                                {['Control', 'Meta', 'Alt'].map(key => (
-                                    <label key={key} className="flex items-center gap-2 cursor-pointer bg-gray-800 p-2 rounded border border-gray-700 hover:bg-gray-700">
-                                        <input 
-                                            type="radio" 
-                                            name="interactionKey"
-                                            checked={shortcuts.interactionKey === key}
-                                            onChange={() => setShortcuts({...shortcuts, interactionKey: key as any})}
-                                            className="accent-indigo-500"
-                                        />
-                                        <span className="text-sm font-mono">{key}</span>
-                                    </label>
-                                ))}
-                             </div>
-                             <p className="text-[10px] text-gray-600 mt-1">注: Mac 用户推荐使用 Meta (Command)。</p>
-                        </div>
-                        
+                   <div className="grid grid-cols-1 gap-4">
                         <div className="space-y-2">
                             <label className="text-[10px] text-gray-500 uppercase font-bold block">禁用/启用切换键</label>
                              <input 
@@ -284,7 +265,7 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
                                 className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-center text-lg font-mono text-white focus:border-indigo-500 outline-none"
                             />
                             <div className="text-center text-xs text-gray-400 mt-2">
-                                当前组合: <span className="font-bold text-white bg-gray-800 px-1 rounded">{shortcuts.interactionKey}</span> + <span className="font-bold text-white bg-gray-800 px-1 rounded">{shortcuts.toggleDisableKey}</span>
+                                当前组合: <span className="font-bold text-white bg-gray-800 px-1 rounded">Ctrl/Cmd</span> + <span className="font-bold text-white bg-gray-800 px-1 rounded">{shortcuts.toggleDisableKey}</span>
                             </div>
                         </div>
                    </div>
@@ -292,9 +273,9 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
                    <div className="border-t border-gray-800 pt-4">
                        <h4 className="text-xs font-bold text-gray-400 mb-2">交互说明</h4>
                        <ul className="text-[11px] text-gray-500 space-y-1 list-disc list-inside">
-                           <li>按住 <strong className="text-gray-300">{shortcuts.interactionKey}</strong> 键进入交互模式。</li>
+                           <li>按住 <strong className="text-gray-300">Ctrl</strong> 或 <strong className="text-gray-300">Command</strong> 键进入交互模式。</li>
                            <li>在交互模式下，鼠标悬浮在输入框的单词上可查看翻译详情。</li>
-                           <li>使用 <strong className="text-gray-300">{shortcuts.interactionKey} + {shortcuts.toggleDisableKey}</strong> 快速禁用/启用光标处的提示词。</li>
+                           <li>使用 <strong className="text-gray-300">Ctrl/Cmd + {shortcuts.toggleDisableKey}</strong> 快速禁用/启用光标处的提示词。</li>
                        </ul>
                    </div>
               </div>

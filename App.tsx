@@ -1,11 +1,13 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages } from 'lucide-react';
+import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart } from 'lucide-react';
 import { parseSegmentsWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
-import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE } from './types';
+import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE, DictionaryEntry } from './types';
 import TagItem from './components/TagItem';
 import CategorySettings from './components/CategorySettings';
+import CollectionSidebar from './components/CollectionSidebar';
+import AddToCollectionModal from './components/AddToCollectionModal';
 
 const App: React.FC = () => {
   const [input, setInput] = useState<string>('');
@@ -29,6 +31,12 @@ const App: React.FC = () => {
     return saved ? JSON.parse(saved) : DEFAULT_SHORTCUTS;
   });
 
+  // Collections State
+  const [isCollectionOpen, setIsCollectionOpen] = useState<boolean>(false);
+  const [showAddToCollectionModal, setShowAddToCollectionModal] = useState<boolean>(false);
+  const [addToCollectionData, setAddToCollectionData] = useState<string>('');
+  const [collectionRefreshTrigger, setCollectionRefreshTrigger] = useState<number>(0);
+
   // Persist Configs
   useEffect(() => {
     localStorage.setItem('comfyui_ai_config', JSON.stringify(aiConfig));
@@ -43,19 +51,27 @@ const App: React.FC = () => {
   const [isInteractionMode, setIsInteractionMode] = useState<boolean>(false);
   const [tooltip, setTooltip] = useState<{ x: number, y: number, tag: PromptTag } | null>(null);
 
+  // Autocomplete State
+  const [suggestions, setSuggestions] = useState<Array<{ key: string } & DictionaryEntry>>([]);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState<number>(0);
+  const [suggestionPos, setSuggestionPos] = useState<{ top: number, left: number } | null>(null);
+
   // Cache: Maps RAW segment text -> Parsed Tag Data
   const tagCache = useRef<Map<string, Omit<PromptTag, 'id'>>>(new Map());
 
   // Refs
   const isUpdatingFromTags = useRef(false);
+  const isPasting = useRef(false); // Ref to track paste state
   const dragItem = useRef<number | null>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const suggestionsRef = useRef<HTMLDivElement>(null);
 
   // Global Key Listeners for Interaction Mode (Ctrl/Meta Press)
   useEffect(() => {
     const handleKeyChange = (e: KeyboardEvent) => {
-      // Toggle interaction mode based on the configured key
-      if (e.key === shortcuts.interactionKey) {
+      // Allow either Control or Meta (Command) to trigger interaction mode
+      if (e.key === 'Control' || e.key === 'Meta') {
         setIsInteractionMode(e.type === 'keydown');
         if (e.type === 'keyup') setTooltip(null);
       }
@@ -76,7 +92,17 @@ const App: React.FC = () => {
       window.removeEventListener('keyup', handleKeyChange);
       window.removeEventListener('blur', handleBlur);
     };
-  }, [shortcuts]);
+  }, []);
+
+  // Auto-scroll effect for suggestions list
+  useEffect(() => {
+    if (suggestionsRef.current && suggestions.length > 0) {
+      const activeElement = suggestionsRef.current.children[activeSuggestionIndex] as HTMLElement;
+      if (activeElement) {
+        activeElement.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  }, [activeSuggestionIndex, suggestions]);
 
   // Helper: Split input string into segments
   const splitInputToSegments = (text: string): string[] => {
@@ -100,6 +126,173 @@ const App: React.FC = () => {
     cleaned = cleaned.replace(/^[\(\[\{<]+|[\)\]\}>]+$/g, '');
     cleaned = cleaned.split(':')[0];
     return cleaned.trim();
+  };
+
+  // --- Suggestion Logic ---
+  const getCaretCoordinates = () => {
+    const el = textareaRef.current;
+    if (!el) return null;
+
+    const { selectionStart } = el;
+    const rect = el.getBoundingClientRect(); // Viewport-relative
+    const style = window.getComputedStyle(el);
+    
+    const div = document.createElement('div');
+    Array.from(style).forEach((prop) => {
+        if (typeof prop === 'string') {
+            div.style.setProperty(prop, style.getPropertyValue(prop));
+        }
+    });
+
+    div.style.position = 'absolute';
+    div.style.visibility = 'hidden';
+    div.style.top = '0';
+    div.style.left = '0';
+    div.style.height = 'auto';
+    div.style.width = el.clientWidth + 'px'; 
+    div.textContent = el.value.substring(0, selectionStart);
+    
+    const span = document.createElement('span');
+    span.textContent = '.'; // Dummy char to measure
+    div.appendChild(span);
+
+    document.body.appendChild(div);
+    
+    const { offsetLeft, offsetTop } = span;
+    const { scrollTop, scrollLeft } = el;
+    const borderTop = parseFloat(style.borderTopWidth) || 0;
+    const borderLeft = parseFloat(style.borderLeftWidth) || 0;
+
+    const top = rect.top + borderTop + offsetTop - scrollTop;
+    const left = rect.left + borderLeft + offsetLeft - scrollLeft;
+
+    document.body.removeChild(div);
+    
+    const lineHeight = parseFloat(style.lineHeight) || 20;
+
+    return {
+        left: left,
+        top: top + lineHeight
+    };
+  };
+
+  const updateSuggestions = (text: string) => {
+    const el = textareaRef.current;
+    if (!el) return;
+
+    const caretPos = el.selectionStart;
+    let start = caretPos;
+    while (start > 0) {
+        const char = text[start - 1];
+        if (char === ',' || char === '，' || char === '\n') break;
+        start--;
+    }
+    
+    const currentSegment = text.substring(start, caretPos).trim();
+
+    if (currentSegment.length > 0) {
+        const cleanQuery = currentSegment.replace(/^[\(\[\{<]+/, '');
+        
+        if (cleanQuery.length > 0) {
+            let results = dictionaryService.search(cleanQuery);
+            
+            // Filter out exact matches (case-insensitive)
+            // If user typed "1girl", don't suggest "1girl" anymore.
+            results = results.filter(r => r.key.toLowerCase() !== cleanQuery.toLowerCase());
+
+            if (results.length > 0) {
+                const coords = getCaretCoordinates();
+                if (coords) {
+                    setSuggestions(results);
+                    setActiveSuggestionIndex(0);
+                    setSuggestionPos({ top: coords.top + 2, left: coords.left }); 
+                    return;
+                }
+            }
+        }
+    }
+    
+    setSuggestions([]);
+    setSuggestionPos(null);
+  };
+
+  const applySuggestion = (suggestion: { key: string }) => {
+     const el = textareaRef.current;
+     if (!el) return;
+     
+     const text = input;
+     const caretPos = el.selectionStart;
+     
+     let start = caretPos;
+     while (start > 0) {
+        const char = text[start - 1];
+        if (char === ',' || char === '，' || char === '\n') break;
+        start--;
+     }
+
+     const prefix = text.substring(0, start);
+     const suffix = text.substring(caretPos);
+     
+     const rawSegment = text.substring(start, caretPos);
+     const syntaxStartMatch = rawSegment.match(/^[\(\[\{<]+/);
+     const syntaxStart = syntaxStartMatch ? syntaxStartMatch[0] : '';
+
+     const newText = prefix + syntaxStart + suggestion.key + suffix;
+     
+     setInput(newText);
+     setSuggestions([]);
+     setSuggestionPos(null);
+
+     const newCaretPos = prefix.length + syntaxStart.length + suggestion.key.length;
+     
+     requestAnimationFrame(() => {
+         if (textareaRef.current) {
+             textareaRef.current.selectionStart = newCaretPos;
+             textareaRef.current.selectionEnd = newCaretPos;
+             textareaRef.current.focus();
+         }
+     });
+
+     setTimeout(() => processInput(newText), 100);
+  };
+
+  // --- Collection Insertion ---
+  const handleInsertFromCollection = (textToInsert: string) => {
+      const el = textareaRef.current;
+      if (!el) {
+          const newInput = input + (input ? ', ' : '') + textToInsert;
+          setInput(newInput);
+          setTimeout(() => processInput(newInput), 100);
+          return;
+      }
+
+      const text = input;
+      const caretPos = el.selectionStart;
+      const prefix = text.substring(0, caretPos);
+      const suffix = text.substring(caretPos);
+      
+      let insertStr = textToInsert;
+      if (prefix.trim().length > 0 && !prefix.trim().endsWith(',')) {
+          insertStr = ', ' + insertStr;
+      }
+      if (suffix.trim().length > 0 && !suffix.trim().startsWith(',')) {
+          insertStr = insertStr + ', ';
+      }
+
+      const newText = prefix + insertStr + suffix;
+      setInput(newText);
+      
+      const newCaretPos = prefix.length + insertStr.length;
+      
+      requestAnimationFrame(() => {
+          if (textareaRef.current) {
+              textareaRef.current.selectionStart = newCaretPos;
+              textareaRef.current.selectionEnd = newCaretPos;
+              textareaRef.current.focus();
+          }
+      });
+      
+      setTimeout(() => processInput(newText), 100);
   };
 
   // CORE LOGIC: Process input changes
@@ -203,7 +396,25 @@ const App: React.FC = () => {
     }
   }, [categories, aiConfig]);
 
-  // Debounce Input
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const val = e.target.value;
+      setInput(val);
+      
+      // Only show suggestions if NOT pasting
+      if (!isPasting.current) {
+          updateSuggestions(val);
+      } else {
+          setSuggestions([]);
+          setSuggestionPos(null);
+      }
+  };
+
+  const handlePaste = () => {
+      isPasting.current = true;
+      // Reset paste flag after a short delay
+      setTimeout(() => { isPasting.current = false; }, 100);
+  };
+
   useEffect(() => {
     if (isUpdatingFromTags.current) {
       isUpdatingFromTags.current = false;
@@ -288,6 +499,7 @@ const App: React.FC = () => {
   const handleClear = () => {
     setInput('');
     setTags([]);
+    setSuggestions([]);
   };
 
   const copyToClipboard = () => {
@@ -305,19 +517,24 @@ const App: React.FC = () => {
     return cat ? cat.color : 'slate';
   };
 
-  const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
+  const handleTextAreaScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     if (backdropRef.current) {
       backdropRef.current.scrollTop = e.currentTarget.scrollTop;
       backdropRef.current.scrollLeft = e.currentTarget.scrollLeft;
     }
+    // Hide suggestions on scroll as position might become invalid
+    setSuggestions([]); 
   };
 
-  // --- Shortcut & Interaction Logic ---
+  const handleBackdropScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    if (textareaRef.current) {
+        textareaRef.current.scrollTop = e.currentTarget.scrollTop;
+        textareaRef.current.scrollLeft = e.currentTarget.scrollLeft;
+    }
+  };
 
-  // Helper: map string position to tags based on delimiters
   const getTagRanges = (inputText: string) => {
     const ranges: {index: number, start: number, end: number}[] = [];
-    // Must match the logic in splitInputToSegments exactly
     const parts = inputText.split(/([,，\n]+)/);
     let currentPos = 0;
     let tagIdx = 0;
@@ -326,7 +543,6 @@ const App: React.FC = () => {
         const isDelimiter = part.match(/^[,，\n]+$/);
         const len = part.length;
         if (!isDelimiter && part.trim().length > 0) {
-            // Found a valid tag segment
             ranges.push({
                 index: tagIdx,
                 start: currentPos,
@@ -340,9 +556,33 @@ const App: React.FC = () => {
   };
 
   const handleTextAreaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    const isModifier = shortcuts.interactionKey === 'Meta' ? e.metaKey : e.ctrlKey;
+    const isModifier = e.ctrlKey || e.metaKey;
     
-    // Toggle Strikethrough
+    // --- Autocomplete Navigation ---
+    if (suggestions.length > 0) {
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setActiveSuggestionIndex(prev => (prev + 1) % suggestions.length);
+            return;
+        }
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setActiveSuggestionIndex(prev => (prev - 1 + suggestions.length) % suggestions.length);
+            return;
+        }
+        if (e.key === 'Enter' || e.key === 'Tab') {
+            e.preventDefault();
+            applySuggestion(suggestions[activeSuggestionIndex]);
+            return;
+        }
+        if (e.key === 'Escape') {
+            setSuggestions([]);
+            return;
+        }
+    }
+
+    // --- Shortcuts ---
+    // 1. Toggle Strikethrough (Ctrl + /)
     if (isModifier && e.key === shortcuts.toggleDisableKey) {
         e.preventDefault();
         const textarea = e.currentTarget;
@@ -353,15 +593,13 @@ const App: React.FC = () => {
         const idsToToggle = new Set<string>();
         
         if (start === end) {
-            // Cursor Mode: Find tag that strictly contains the cursor
-            // Note: If cursor is at the exact boundary of two tags (e.g., "tag1|tag2"), logic favors the one it's "in".
+            // Cursor Mode
             const target = ranges.find(r => start >= r.start && start <= r.end);
             if (target && tags[target.index]) {
                 idsToToggle.add(tags[target.index].id);
             }
         } else {
-            // Selection Mode: Find tags that overlap with the selection
-            // Overlap logic: (RangeStart < SelEnd) && (RangeEnd > SelStart)
+            // Selection Mode
             ranges.forEach(r => {
                 if (r.start < end && r.end > start) {
                      if (tags[r.index]) idsToToggle.add(tags[r.index].id);
@@ -381,19 +619,56 @@ const App: React.FC = () => {
             });
         }
     }
+
+    // 2. Add to Collection (Ctrl + J)
+    if (isModifier && e.key === 'j') {
+        e.preventDefault();
+        const textarea = e.currentTarget;
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        const ranges = getTagRanges(input);
+        
+        const selectedTexts: string[] = [];
+        const seenIds = new Set<string>();
+
+        // Find overlapping tags with current selection
+        ranges.forEach(r => {
+             const isOverlap = (start === end) 
+                ? (start >= r.start && start <= r.end)
+                : (r.start < end && r.end > start);
+             
+             if (isOverlap && tags[r.index]) {
+                 if (!seenIds.has(tags[r.index].id)) {
+                     selectedTexts.push(tags[r.index].raw);
+                     seenIds.add(tags[r.index].id);
+                 }
+             }
+        });
+        
+        let textToSave = selectedTexts.join(', ');
+        
+        // Fallback: if no tags identified, use raw text selection
+        if (!textToSave && start !== end) {
+            textToSave = input.substring(start, end);
+        }
+
+        if (textToSave) {
+            setAddToCollectionData(textToSave);
+            setShowAddToCollectionModal(true);
+            setIsCollectionOpen(true); // Open collection popover to show context
+        }
+    }
   };
 
   const handleSegmentHover = (e: React.MouseEvent, tagIndex: number) => {
-      // Only show tooltip in interaction mode
       if (!isInteractionMode) return;
       const tag = tags[tagIndex];
       if (!tag) return;
       
       const rect = (e.target as HTMLElement).getBoundingClientRect();
-      // Calculate position relative to viewport
       setTooltip({
           x: rect.left + rect.width / 2,
-          y: rect.bottom + 8, // slight offset
+          y: rect.bottom + 8,
           tag: tag
       });
   };
@@ -406,7 +681,7 @@ const App: React.FC = () => {
 
     return segmentsAndDelimiters.map((part, i) => {
         if (part.match(/^[,，\n]+$/)) {
-            return <span key={i} className="text-amber-500/70 font-bold">{part}</span>;
+            return <span key={i} className="text-amber-500/70 font-bold box-decoration-clone">{part}</span>;
         }
         
         if (!part.trim()) {
@@ -418,7 +693,6 @@ const App: React.FC = () => {
         const isDisabled = tagState?.disabled;
         const isHovered = hoveredTagIndex === currentTagIndex;
         
-        // In Interaction Mode, highlight tags that are hoverable
         const interactionClass = isInteractionMode ? 'hover:bg-indigo-900/40 hover:outline hover:outline-1 hover:outline-indigo-500/50 cursor-help rounded-[2px]' : '';
 
         const innerContent = (() => {
@@ -428,16 +702,16 @@ const App: React.FC = () => {
            return subParts.map((sub, j) => {
               if (!sub) return null;
               let colorClass = 'text-gray-300';
-              if (sub.startsWith('<') && sub.endsWith('>')) colorClass = 'text-rose-400 font-bold';
-              else if (sub.startsWith('{') && sub.endsWith('}')) colorClass = 'text-cyan-400 font-bold';
-              else if (sub.startsWith('(') && sub.endsWith(')')) colorClass = 'text-amber-400 font-bold';
-              else if (sub.startsWith('[') && sub.endsWith(']')) colorClass = 'text-indigo-400 font-bold';
+              if (sub.startsWith('<') && sub.endsWith('>')) colorClass = 'text-rose-400';
+              else if (sub.startsWith('{') && sub.endsWith('}')) colorClass = 'text-cyan-400';
+              else if (sub.startsWith('(') && sub.endsWith(')')) colorClass = 'text-amber-400';
+              else if (sub.startsWith('[') && sub.endsWith(']')) colorClass = 'text-indigo-400';
               return <span key={`${i}-${j}`} className={colorClass}>{sub}</span>
            });
         })();
 
         const hoverClass = isHovered 
-            ? 'bg-indigo-600/50 ring-2 ring-indigo-400 text-white font-bold shadow-[0_0_12px_rgba(99,102,241,0.5)] z-10 rounded-sm box-decoration-clone' 
+            ? 'bg-indigo-600/50 ring-2 ring-indigo-400 text-white shadow-[0_0_12px_rgba(99,102,241,0.5)] z-10 rounded-sm' 
             : '';
         const disabledClass = isDisabled ? 'line-through text-gray-600 decoration-gray-500 opacity-60' : '';
 
@@ -446,7 +720,7 @@ const App: React.FC = () => {
                 key={i} 
                 onMouseEnter={(e) => handleSegmentHover(e, currentTagIndex)}
                 onMouseLeave={() => setTooltip(null)}
-                className={`${hoverClass} ${disabledClass} ${interactionClass} transition-all duration-150 inline-block`}
+                className={`${hoverClass} ${disabledClass} ${interactionClass} transition-all duration-150 box-decoration-clone`}
             >
                 {innerContent}
             </span>
@@ -454,12 +728,9 @@ const App: React.FC = () => {
     });
   };
 
-  // Tooltip Component
   const TagDetailTooltip = () => {
     if (!tooltip) return null;
     const { x, y, tag } = tooltip;
-    
-    // Resolve Color
     const cat = categories.find(c => c.name === tag.category);
     const colorVal = COLOR_PALETTE.find(c => c.name === (cat?.color || 'slate'))?.value;
 
@@ -485,21 +756,84 @@ const App: React.FC = () => {
     );
   };
 
+  const typographyClasses = "font-mono text-sm leading-relaxed whitespace-pre-wrap break-words tracking-normal";
+
   return (
-    <div className="min-h-screen p-4 md:p-6 lg:p-8 max-w-7xl mx-auto flex flex-col gap-5 text-gray-200 font-sans">
+    <div className="min-h-screen p-4 md:p-6 lg:p-8 max-w-7xl mx-auto flex flex-col gap-5 text-gray-200 font-sans relative">
       <TagDetailTooltip />
+      
+      {/* Suggestions Popover */}
+      {suggestions.length > 0 && suggestionPos && (
+          <div 
+              ref={suggestionsRef}
+              className="fixed z-[9999] w-72 max-h-80 overflow-y-auto bg-gray-900 border border-gray-700 rounded-lg shadow-2xl flex flex-col custom-scrollbar animate-in fade-in zoom-in-95 duration-100"
+              style={{ top: suggestionPos.top, left: suggestionPos.left }}
+          >
+              {suggestions.map((item, index) => (
+                  <button
+                      key={item.key}
+                      onClick={() => applySuggestion(item)}
+                      className={`
+                          text-left px-2 py-1.5 text-xs border-b border-gray-800 last:border-0 flex flex-col
+                          ${index === activeSuggestionIndex ? 'bg-indigo-900/50 text-white' : 'text-gray-300 hover:bg-gray-800'}
+                      `}
+                  >
+                      <div className="flex items-center justify-between w-full">
+                          <span className="font-bold truncate mr-2">{item.key}</span>
+                          <span className="text-[9px] opacity-60 bg-gray-800 px-1 rounded whitespace-nowrap">{item.category}</span>
+                      </div>
+                      <span className="opacity-70 text-[10px] truncate">{item.translation}</span>
+                  </button>
+              ))}
+          </div>
+      )}
+
+      {/* Global Click Outside for Collection Popover */}
+      {isCollectionOpen && (
+          <div className="fixed inset-0 z-30 bg-transparent" onClick={() => setIsCollectionOpen(false)}></div>
+      )}
+
+      {/* Add To Collection Modal */}
+      <AddToCollectionModal 
+        isOpen={showAddToCollectionModal}
+        onClose={() => setShowAddToCollectionModal(false)}
+        initialText={addToCollectionData}
+        onSuccess={() => setCollectionRefreshTrigger(prev => prev + 1)}
+      />
 
       {/* Header */}
-      <header className="flex items-center justify-between pb-4 border-b border-gray-800/50">
+      <header className="flex items-center justify-between pb-4 border-b border-gray-800/50 relative z-40">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg shadow-lg shadow-purple-900/20">
-            <Layers className="text-white" size={20} />
+          {/* Collection Dropdown Container */}
+          <div className="relative">
+              <button 
+                onClick={() => setIsCollectionOpen(!isCollectionOpen)}
+                className={`p-2 rounded-lg transition-colors ${isCollectionOpen ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-900/40' : 'bg-gray-800 text-gray-400 hover:text-white'}`}
+              >
+                <FolderHeart size={20} />
+              </button>
+              
+              {isCollectionOpen && (
+                  <CollectionSidebar 
+                    onClose={() => setIsCollectionOpen(false)} 
+                    onInsert={handleInsertFromCollection}
+                    refreshTrigger={collectionRefreshTrigger}
+                  />
+              )}
           </div>
-          <div>
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
-              ComfyUI 提示词助手
-            </h1>
-            <p className="text-xs text-gray-500">双向绑定 · 智能增量解析 · 本地词库加速</p>
+          
+          <div className="h-8 w-[1px] bg-gray-800 mx-1"></div>
+
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg shadow-lg shadow-purple-900/20">
+                <Layers className="text-white" size={20} />
+            </div>
+            <div>
+                <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
+                ComfyUI 提示词助手
+                </h1>
+                <p className="text-xs text-gray-500">双向绑定 · 智能增量解析 · 本地词库加速</p>
+            </div>
           </div>
         </div>
         <button 
@@ -520,17 +854,19 @@ const App: React.FC = () => {
             <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">原始输入 (Raw Input)</h2>
             <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
               <Info size={10} />
-              {isInteractionMode ? '交互模式: 悬浮查看详情' : `按住 ${shortcuts.interactionKey} 悬浮 · ${shortcuts.interactionKey}+${shortcuts.toggleDisableKey} 禁用`}
+              {isInteractionMode ? '交互模式: 悬浮查看详情' : `Ctrl/Cmd+J 收藏 · Ctrl/Cmd+${shortcuts.toggleDisableKey} 禁用`}
             </div>
           </div>
           
           <div className="relative flex-grow min-h-[250px] lg:min-h-[500px] bg-gray-900/50 rounded-xl border border-gray-700/50 focus-within:border-indigo-500/50 focus-within:ring-1 focus-within:ring-indigo-500/20 transition-all shadow-inner overflow-hidden group">
             
-            {/* Highlighter Backdrop - becomes INTERACTIVE layer when InteractionMode is ON */}
+            {/* Highlighter Backdrop */}
             <div 
                 ref={backdropRef}
+                onScroll={handleBackdropScroll}
                 className={`
-                    absolute inset-0 p-4 font-mono text-sm leading-relaxed overflow-hidden whitespace-pre-wrap break-words
+                    absolute inset-0 p-4 overflow-y-scroll custom-scrollbar
+                    ${typographyClasses}
                     ${isInteractionMode ? 'pointer-events-auto z-20' : 'pointer-events-none z-0'}
                 `}
                 aria-hidden="true"
@@ -538,22 +874,25 @@ const App: React.FC = () => {
                 {highlightInput(input)}
             </div>
 
-            {/* Actual Input - becomes INACTIVE when InteractionMode is ON */}
+            {/* Actual Input */}
             <textarea
+              ref={textareaRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onScroll={handleScroll}
+              onChange={handleInputChange}
+              onPaste={handlePaste}
+              onScroll={handleTextAreaScroll}
               onKeyDown={handleTextAreaKeyDown}
               spellCheck={false}
-              placeholder="在这里输入提示词，逗号分隔..."
+              placeholder="在这里输入提示词，逗号分隔... (输入文字会自动联想)"
               className={`
-                relative w-full h-full bg-transparent p-4 resize-none outline-none font-mono text-sm leading-relaxed caret-white custom-scrollbar
+                relative w-full h-full bg-transparent p-4 resize-none outline-none caret-white overflow-y-scroll custom-scrollbar
+                ${typographyClasses}
                 ${input ? 'text-transparent' : 'text-gray-300'} 
                 ${isInteractionMode ? 'pointer-events-none z-0' : 'pointer-events-auto z-10'}
                 placeholder-gray-600
               `}
             />
-            
+
             {/* Floating Actions */}
             <div className="absolute bottom-3 right-3 flex gap-2 z-30 pointer-events-auto">
               <button

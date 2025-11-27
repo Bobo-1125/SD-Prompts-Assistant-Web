@@ -51,15 +51,25 @@ export const DEFAULT_AI_CONFIG: AIConfig = {
 
 export interface ShortcutConfig {
   toggleDisableKey: string; // e.g., '/'
-  interactionKey: 'Control' | 'Meta' | 'Alt'; // Main modifier
 }
 
 export const DEFAULT_SHORTCUTS: ShortcutConfig = {
   toggleDisableKey: '/',
-  interactionKey: 'Control'
 };
 
 export type DictionaryMap = Record<string, DictionaryEntry>;
+
+// --- New Collection Types ---
+export interface CollectionNode {
+  id: string;
+  name: string;
+  type: 'folder' | 'item';
+  content?: string; // Only for items
+  children?: CollectionNode[]; // Only for folders
+  isOpen?: boolean; // UI state for folders
+  createdAt: number;
+}
+// ----------------------------
 
 export const COLOR_PALETTE = [
   { name: 'blue', value: 'bg-blue-900/40 border-blue-700/50 text-blue-200' },
