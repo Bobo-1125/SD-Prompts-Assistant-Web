@@ -1,6 +1,6 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart } from 'lucide-react';
+import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette } from 'lucide-react';
 import { parseSegmentsWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
 import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE, DictionaryEntry } from './types';
@@ -19,6 +19,11 @@ const App: React.FC = () => {
   const [categories, setCategories] = useState<CategoryDef[]>(DEFAULT_CATEGORIES);
   const [showTranslation, setShowTranslation] = useState<boolean>(true);
   
+  // Highlight Toggle State
+  const [enableHighlighting, setEnableHighlighting] = useState<boolean>(() => {
+    return localStorage.getItem('comfyui_highlighting') === 'true';
+  });
+
   // AI Config State
   const [aiConfig, setAiConfig] = useState<AIConfig>(() => {
     const saved = localStorage.getItem('comfyui_ai_config');
@@ -45,6 +50,10 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('comfyui_shortcuts', JSON.stringify(shortcuts));
   }, [shortcuts]);
+
+  useEffect(() => {
+    localStorage.setItem('comfyui_highlighting', String(enableHighlighting));
+  }, [enableHighlighting]);
 
   // Interaction State
   const [hoveredTagIndex, setHoveredTagIndex] = useState<number | null>(null);
@@ -118,6 +127,24 @@ const App: React.FC = () => {
     if (text.startsWith('{') && text.endsWith('}')) return SyntaxType.DYNAMIC;
     if ((text.startsWith('(') && text.endsWith(')')) || (text.startsWith('[') && text.endsWith(']'))) return SyntaxType.WEIGHTED;
     return SyntaxType.NORMAL;
+  };
+
+  // Helper: Get text color class based on category color name
+  const getCategoryTextColor = (color: string) => {
+    switch(color) {
+      case 'blue': return 'text-blue-400';
+      case 'purple': return 'text-purple-400';
+      case 'emerald': return 'text-emerald-400';
+      case 'rose': return 'text-rose-400';
+      case 'amber': return 'text-amber-400';
+      case 'cyan': return 'text-cyan-400';
+      case 'pink': return 'text-pink-400';
+      case 'indigo': return 'text-indigo-400';
+      case 'teal': return 'text-teal-400';
+      case 'orange': return 'text-orange-400';
+      case 'slate': return 'text-slate-400';
+      default: return 'text-gray-300';
+    }
   };
 
   // Helper: Clean text for dictionary lookup
@@ -695,7 +722,21 @@ const App: React.FC = () => {
         
         const interactionClass = isInteractionMode ? 'hover:bg-indigo-900/40 hover:outline hover:outline-1 hover:outline-indigo-500/50 cursor-help rounded-[2px]' : '';
 
+        // Calculate Category Color if highlighting is enabled
+        let categoryColorClass = '';
+        if (enableHighlighting && tagState && !isDisabled) {
+           const cat = categories.find(c => c.name === tagState.category);
+           categoryColorClass = getCategoryTextColor(cat?.color || 'slate');
+        }
+
         const innerContent = (() => {
+           // If category highlighting is enabled, we skip the specific syntax coloring 
+           // and simply render the text so it inherits the parent's category color.
+           if (enableHighlighting) {
+               return part;
+           }
+
+           // Default Syntax highlighting logic
            const regex = /(\<[^>]+?\>|\{[^}]+?\}|\([^)]+?\)|\[[^\]]+?\])/g;
            const subParts = part.split(regex);
            
@@ -720,7 +761,7 @@ const App: React.FC = () => {
                 key={i} 
                 onMouseEnter={(e) => handleSegmentHover(e, currentTagIndex)}
                 onMouseLeave={() => setTooltip(null)}
-                className={`${hoverClass} ${disabledClass} ${interactionClass} transition-all duration-150 box-decoration-clone`}
+                className={`${hoverClass} ${disabledClass} ${interactionClass} ${categoryColorClass} transition-all duration-150 box-decoration-clone`}
             >
                 {innerContent}
             </span>
@@ -851,7 +892,16 @@ const App: React.FC = () => {
         {/* Left Column: Input (5 cols) */}
         <div className="lg:col-span-5 flex flex-col gap-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">原始输入 (Raw Input)</h2>
+            <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">原始输入 (Raw Input)</h2>
+                <button 
+                  onClick={() => setEnableHighlighting(!enableHighlighting)}
+                  className={`p-1 rounded-md transition-colors ${enableHighlighting ? 'text-indigo-400 bg-indigo-900/30' : 'text-gray-500 hover:text-gray-300'}`}
+                  title={enableHighlighting ? "关闭分类颜色高亮" : "开启分类颜色高亮"}
+                >
+                  <Palette size={14} />
+                </button>
+            </div>
             <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
               <Info size={10} />
               {isInteractionMode ? '交互模式: 悬浮查看详情' : `Ctrl/Cmd+J 收藏 · Ctrl/Cmd+${shortcuts.toggleDisableKey} 禁用`}
