@@ -68,6 +68,12 @@ const App: React.FC = () => {
   // Cache: Maps RAW segment text -> Parsed Tag Data
   const tagCache = useRef<Map<string, Omit<PromptTag, 'id'>>>(new Map());
 
+  // Race Condition Fix: Track the latest input to prevent stale async updates
+  const latestInputRef = useRef<string>(input);
+  useEffect(() => {
+    latestInputRef.current = input;
+  }, [input]);
+
   // Refs
   const isUpdatingFromTags = useRef(false);
   const isPasting = useRef(false); // Ref to track paste state
@@ -403,6 +409,14 @@ const App: React.FC = () => {
         
         dictionaryService.learnBatch(tagsToLearn);
 
+        // RACE CONDITION FIX:
+        // Check if the input has changed while we were waiting for AI.
+        // If it has changed, we still cached the results above (so next run is fast),
+        // but we DO NOT update the UI state with this stale data.
+        if (latestInputRef.current !== currentInput) {
+             return;
+        }
+
         const updatedTags = [...newTags];
         missingSegmentIndices.forEach(index => {
           const segmentRaw = rawSegments[index];
@@ -418,7 +432,10 @@ const App: React.FC = () => {
 
       } catch (error) {
         console.error("Failed to fetch segments", error);
-        setTags(prev => prev.map(t => ({ ...t, isRefreshing: false })));
+        // Only turn off refreshing if we are still on the same input
+        if (latestInputRef.current === currentInput) {
+            setTags(prev => prev.map(t => ({ ...t, isRefreshing: false })));
+        }
       }
     }
   }, [categories, aiConfig]);

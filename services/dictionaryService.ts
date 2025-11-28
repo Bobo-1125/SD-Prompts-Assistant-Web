@@ -99,6 +99,9 @@ class DictionaryService {
   public learn(tag: PromptTag) {
     if (!tag || !tag.englishText) return;
     
+    // Filter: Do not learn tags with category '其他'
+    if (tag.category === '其他') return;
+    
     const normalized = tag.englishText.toLowerCase().trim();
     
     if (SEED_DICTIONARY[normalized]) return;
@@ -123,6 +126,9 @@ class DictionaryService {
   public learnBatch(tags: PromptTag[]) {
     let changed = false;
     tags.forEach(tag => {
+        // Filter: Do not learn tags with category '其他'
+        if (tag.category === '其他') return;
+
         const normalized = tag.englishText.toLowerCase().trim();
         if (SEED_DICTIONARY[normalized]) return;
         
