@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { X, Plus, RotateCcw, Download, Trash, Database, Bot, LayoutGrid, Keyboard } from 'lucide-react';
+import { X, Plus, RotateCcw, Download, Trash, Database, Bot, LayoutGrid, Keyboard, Languages } from 'lucide-react';
 import { CategoryDef, COLOR_PALETTE, DEFAULT_CATEGORIES, AIConfig, ShortcutConfig } from '../types';
 import { dictionaryService } from '../services/dictionaryService';
 
@@ -59,6 +59,13 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
 
   const handleAIConfigChange = (key: keyof AIConfig, value: any) => {
     setAiConfig({ ...aiConfig, [key]: value });
+  };
+  
+  const handleBaiduConfigChange = (key: 'enabled' | 'appId' | 'secretKey', value: any) => {
+    setAiConfig({ 
+        ...aiConfig, 
+        baidu: { ...aiConfig.baidu, [key]: value } 
+    });
   };
 
   return (
@@ -188,60 +195,110 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
           {/* TAB: AI Config */}
           {activeTab === 'ai' && (
              <div className="space-y-6">
-                <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium text-gray-200">启用自定义 AI 提供商</span>
-                    <button 
-                        onClick={() => handleAIConfigChange('useCustom', !aiConfig.useCustom)}
-                        className={`w-10 h-5 rounded-full relative transition-colors ${aiConfig.useCustom ? 'bg-indigo-600' : 'bg-gray-700'}`}
-                    >
-                        <div className={`absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-transform ${aiConfig.useCustom ? 'translate-x-5' : ''}`}></div>
-                    </button>
+                
+                {/* Custom AI Provider */}
+                <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-gray-200 flex items-center gap-2">
+                            <Bot size={16} />
+                            自定义 LLM 提供商
+                        </span>
+                        <button 
+                            onClick={() => handleAIConfigChange('useCustom', !aiConfig.useCustom)}
+                            className={`w-10 h-5 rounded-full relative transition-colors ${aiConfig.useCustom ? 'bg-indigo-600' : 'bg-gray-700'}`}
+                        >
+                            <div className={`absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-transform ${aiConfig.useCustom ? 'translate-x-5' : ''}`}></div>
+                        </button>
+                    </div>
+
+                    {aiConfig.useCustom && (
+                        <div className="space-y-3 animate-in fade-in slide-in-from-top-2 bg-gray-800/30 p-3 rounded-lg border border-gray-800">
+                            <div className="space-y-1">
+                                <label className="text-[10px] text-gray-500 uppercase font-bold">Base URL</label>
+                                <input 
+                                    type="text" 
+                                    value={aiConfig.baseUrl}
+                                    onChange={e => handleAIConfigChange('baseUrl', e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
+                                    placeholder="https://api.siliconflow.cn/v1"
+                                />
+                            </div>
+
+                            <div className="space-y-1">
+                                <label className="text-[10px] text-gray-500 uppercase font-bold">API Key (App Key)</label>
+                                <input 
+                                    type="password" 
+                                    value={aiConfig.apiKey}
+                                    onChange={e => handleAIConfigChange('apiKey', e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
+                                    placeholder="sk-..."
+                                />
+                            </div>
+
+                            <div className="space-y-1">
+                                <label className="text-[10px] text-gray-500 uppercase font-bold">Model Name</label>
+                                <input 
+                                    type="text" 
+                                    value={aiConfig.model}
+                                    onChange={e => handleAIConfigChange('model', e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
+                                    placeholder="deepseek-ai/DeepSeek-V2.5"
+                                />
+                            </div>
+                        </div>
+                    )}
                 </div>
 
-                {aiConfig.useCustom && (
-                    <div className="space-y-4 animate-in fade-in slide-in-from-top-2">
-                        <div className="p-3 bg-amber-900/20 border border-amber-800/50 rounded text-[11px] text-amber-200/80">
-                           请输入 OpenAI 兼容的 API 配置 (例如 SiliconFlow, DeepSeek 等)。
-                        </div>
+                <div className="w-full h-[1px] bg-gray-800 my-2"></div>
 
-                        <div className="space-y-1">
-                            <label className="text-[10px] text-gray-500 uppercase font-bold">Base URL</label>
-                            <input 
-                                type="text" 
-                                value={aiConfig.baseUrl}
-                                onChange={e => handleAIConfigChange('baseUrl', e.target.value)}
-                                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
-                                placeholder="https://api.siliconflow.cn/v1"
-                            />
-                        </div>
-
-                        <div className="space-y-1">
-                            <label className="text-[10px] text-gray-500 uppercase font-bold">API Key (App Key)</label>
-                            <input 
-                                type="password" 
-                                value={aiConfig.apiKey}
-                                onChange={e => handleAIConfigChange('apiKey', e.target.value)}
-                                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
-                                placeholder="sk-..."
-                            />
-                        </div>
-
-                        <div className="space-y-1">
-                            <label className="text-[10px] text-gray-500 uppercase font-bold">Model Name</label>
-                            <input 
-                                type="text" 
-                                value={aiConfig.model}
-                                onChange={e => handleAIConfigChange('model', e.target.value)}
-                                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
-                                placeholder="deepseek-ai/DeepSeek-V2.5"
-                            />
-                        </div>
+                {/* Baidu Translation Config */}
+                <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-gray-200 flex items-center gap-2">
+                            <Languages size={16} />
+                            百度通用翻译 API 加速
+                        </span>
+                        <button 
+                            onClick={() => handleBaiduConfigChange('enabled', !aiConfig.baidu?.enabled)}
+                            className={`w-10 h-5 rounded-full relative transition-colors ${aiConfig.baidu?.enabled ? 'bg-indigo-600' : 'bg-gray-700'}`}
+                        >
+                            <div className={`absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-transform ${aiConfig.baidu?.enabled ? 'translate-x-5' : ''}`}></div>
+                        </button>
                     </div>
-                )}
-                
-                {!aiConfig.useCustom && (
-                    <div className="text-xs text-gray-500 text-center py-8 italic">
-                        正在使用系统默认 AI 模型 (Gemini 2.5 Flash)
+                    
+                    {aiConfig.baidu?.enabled && (
+                        <div className="space-y-3 animate-in fade-in slide-in-from-top-2 bg-gray-800/30 p-3 rounded-lg border border-gray-800">
+                             <div className="text-[10px] text-gray-400 bg-indigo-900/20 p-2 rounded border border-indigo-900/30">
+                                开启后，将优先使用百度翻译处理文本，AI 仅负责分类。这将大幅提高响应速度并节省 AI Token。<br/>
+                                <a href="https://fanyi-api.baidu.com/product/11" target="_blank" className="underline text-indigo-400">申请百度翻译 API Key</a>
+                             </div>
+                             <div className="space-y-1">
+                                <label className="text-[10px] text-gray-500 uppercase font-bold">APP ID</label>
+                                <input 
+                                    type="text" 
+                                    value={aiConfig.baidu?.appId || ''}
+                                    onChange={e => handleBaiduConfigChange('appId', e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
+                                    placeholder="2024..."
+                                />
+                            </div>
+                            <div className="space-y-1">
+                                <label className="text-[10px] text-gray-500 uppercase font-bold">Secret Key</label>
+                                <input 
+                                    type="password" 
+                                    value={aiConfig.baidu?.secretKey || ''}
+                                    onChange={e => handleBaiduConfigChange('secretKey', e.target.value)}
+                                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 outline-none font-mono"
+                                    placeholder="密钥..."
+                                />
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {!aiConfig.useCustom && !aiConfig.baidu?.enabled && (
+                    <div className="text-xs text-gray-500 text-center py-4 italic">
+                        正在使用系统默认 AI 模型 (Gemini 2.5 Flash) 处理所有任务。
                     </div>
                 )}
              </div>

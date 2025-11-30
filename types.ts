@@ -35,18 +35,30 @@ export interface DictionaryEntry {
   syntaxType?: SyntaxType;
 }
 
+export interface BaiduConfig {
+  enabled: boolean;
+  appId: string;
+  secretKey: string;
+}
+
 export interface AIConfig {
   useCustom: boolean;
   apiKey: string;
   baseUrl: string;
   model: string;
+  baidu: BaiduConfig;
 }
 
 export const DEFAULT_AI_CONFIG: AIConfig = {
   useCustom: false,
   apiKey: '',
   baseUrl: 'https://api.siliconflow.cn/v1',
-  model: 'deepseek-ai/DeepSeek-V2.5'
+  model: 'deepseek-ai/DeepSeek-V2.5',
+  baidu: {
+    enabled: false,
+    appId: '',
+    secretKey: ''
+  }
 };
 
 export interface ShortcutConfig {

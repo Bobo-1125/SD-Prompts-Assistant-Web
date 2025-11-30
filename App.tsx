@@ -24,6 +24,9 @@ const App: React.FC = () => {
     return localStorage.getItem('comfyui_highlighting') === 'true';
   });
 
+  // Language Toggle State for Input
+  const [isInputChinese, setIsInputChinese] = useState<boolean>(false);
+
   // AI Config State
   const [aiConfig, setAiConfig] = useState<AIConfig>(() => {
     const saved = localStorage.getItem('comfyui_ai_config');
@@ -451,6 +454,72 @@ const App: React.FC = () => {
           setSuggestions([]);
           setSuggestionPos(null);
       }
+  };
+
+  const handleLanguageToggle = () => {
+    const nextIsChinese = !isInputChinese;
+    
+    // Split preserving delimiters to reconstruct the exact string structure
+    const parts = input.split(/([,，\n]+)/);
+    let tagIndex = 0;
+    
+    const cacheUpdates = new Map<string, Omit<PromptTag, 'id'>>();
+
+    const newParts = parts.map(part => {
+         // If it's a delimiter or empty, return as is
+         if (part.match(/^[,，\n]+$/) || !part.trim()) return part;
+         
+         const currentTag = tags[tagIndex];
+         tagIndex++;
+         
+         // Safety check: if tags are out of sync or refreshing, keep original text
+         if (!currentTag || currentTag.isRefreshing) return part;
+
+         // Check if we have the target data
+         const hasTranslation = currentTag.translation && currentTag.translation !== '...';
+         const hasEnglish = currentTag.englishText;
+
+         if (nextIsChinese && !hasTranslation) return part;
+         if (!nextIsChinese && !hasEnglish) return part;
+
+         // Determine target text
+         // If switching to Chinese, use translation. If switching to English, use englishText.
+         const targetText = nextIsChinese ? currentTag.translation : currentTag.englishText;
+         
+         // Preserve leading/trailing whitespace of the segment
+         const match = part.match(/^(\s*)(.*?)(\s*)$/);
+         const prefix = match ? match[1] : '';
+         const suffix = match ? match[3] : '';
+         
+         // Pre-fill cache for the NEW text (targetText)
+         // This ensures that when processInput runs on the new text, it finds the data immediately.
+         const newCacheData = {
+             ...currentTag,
+             raw: targetText, 
+             // IMPORTANT: We preserve the semantic data regardless of display language
+             // When displaying Chinese (raw=translation), englishText remains "1girl".
+             // When displaying English (raw=englishText), translation remains "1个女孩".
+         };
+         
+         cacheUpdates.set(targetText, newCacheData);
+
+         return prefix + targetText + suffix;
+    });
+
+    // Apply cache updates synchronously
+    cacheUpdates.forEach((val, key) => {
+        tagCache.current.set(key, val);
+    });
+
+    const newInput = newParts.join('');
+    
+    // Update ref immediately to prevent race condition logic in processInput from blocking this
+    latestInputRef.current = newInput;
+    
+    setInput(newInput);
+    setIsInputChinese(nextIsChinese);
+    
+    // processInput will be triggered by useEffect, and it will hit the cache we just populated.
   };
 
   const handlePaste = () => {
@@ -911,13 +980,24 @@ const App: React.FC = () => {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
                 <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">原始输入 (Raw Input)</h2>
-                <button 
-                  onClick={() => setEnableHighlighting(!enableHighlighting)}
-                  className={`p-1 rounded-md transition-colors ${enableHighlighting ? 'text-indigo-400 bg-indigo-900/30' : 'text-gray-500 hover:text-gray-300'}`}
-                  title={enableHighlighting ? "关闭分类颜色高亮" : "开启分类颜色高亮"}
-                >
-                  <Palette size={14} />
-                </button>
+                
+                <div className="flex items-center bg-gray-800/50 rounded-lg p-0.5 border border-gray-700/50">
+                    <button 
+                      onClick={() => setEnableHighlighting(!enableHighlighting)}
+                      className={`p-1 rounded-md transition-colors ${enableHighlighting ? 'text-indigo-400 bg-indigo-900/30' : 'text-gray-500 hover:text-gray-300'}`}
+                      title={enableHighlighting ? "关闭分类颜色高亮" : "开启分类颜色高亮"}
+                    >
+                      <Palette size={14} />
+                    </button>
+                    <div className="w-[1px] h-3 bg-gray-700 mx-0.5"></div>
+                    <button 
+                      onClick={handleLanguageToggle}
+                      className={`p-1 rounded-md transition-colors ${isInputChinese ? 'text-emerald-400 bg-emerald-900/30' : 'text-gray-500 hover:text-gray-300'}`}
+                      title={isInputChinese ? "切换回英文显示 (Revert to English)" : "切换为中文显示 (Translate to Chinese)"}
+                    >
+                      <Languages size={14} />
+                    </button>
+                </div>
             </div>
             <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
               <Info size={10} />

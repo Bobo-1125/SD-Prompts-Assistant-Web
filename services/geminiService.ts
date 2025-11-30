@@ -1,6 +1,7 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
 import { SyntaxType, CategoryDef, PromptTag, AIConfig } from "../types";
+import { translateWithBaidu } from "./baiduService";
 
 const apiKey = process.env.API_KEY || '';
 const ai = new GoogleGenAI({ apiKey });
@@ -19,12 +20,12 @@ const detectSyntax = (text: string): SyntaxType => {
   return SyntaxType.NORMAL;
 };
 
+// --- PROMPTS ---
+
 /**
- * 1. Optimized System Instruction
- * Removed request for syntaxType and raw text echo.
- * Shortened field names to reduce token count.
+ * STANDARD PROMPT: AI does Translation + Classification
  */
-const createSystemInstruction = (categories: string[]) => `
+const createStandardSystemInstruction = (categories: string[]) => `
 Task: Translate and Classify ComfyUI prompt segments.
 
 Input: JSON Array of strings.
@@ -44,24 +45,26 @@ Output JSON Keys:
 `;
 
 /**
- * 2. Optimized Custom Prompt
+ * HYBRID PROMPT: AI only does Classification (Translation provided by Baidu)
  */
-const getCustomSystemPrompt = (categories: string[]) => `
-Analyze prompt segments.
-Categories: [${categories.join(', ')}]
+const createHybridSystemInstruction = (categories: string[]) => `
+Task: Classify prompt segments based on provided text and translation.
 
-Return JSON object with "tags" array.
-For each segment, return:
-{ "en": "English", "cn": "Chinese", "cat": "Category" }
+Input: JSON Array of objects: { "en": "EnglishText", "cn_hint": "PreTranslatedText" }
+Output: JSON Array of objects.
 
 Rules:
-1. 'en': Input translated to English.
-2. 'cn': Input translated to Chinese.
-3. 'cat': One of the provided categories.
-4. Do NOT analyze syntax (brackets, lora). Just translate meaning.
+1. 'cat': Choose best fit from: [${categories.join(', ')}].
+2. 'en': Refine the English text if needed, usually keep as is.
+3. 'cn': Use the 'cn_hint' as the translation unless it is completely wrong.
+4. Maintain exact order.
+
+Output JSON Keys:
+- en: English Text
+- cn: Chinese Translation
+- cat: Category
 `;
 
-// 3. Optimized Schema (Minified keys)
 const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
@@ -82,7 +85,6 @@ const RESPONSE_SCHEMA = {
 
 /**
  * Helper to normalize AI response and merge with Original Segments
- * Reconstructs the full PromptTag object locally.
  */
 const normalizeTags = (aiResult: any, originalSegments: string[]): any[] => {
   let resultList: any[] = [];
@@ -120,25 +122,24 @@ const normalizeTags = (aiResult: any, originalSegments: string[]): any[] => {
   });
 };
 
-const parseWithDefaultGemini = async (segments: string[], categoryNames: string[]): Promise<any> => {
-  const response = await ai.models.generateContent({
-    model: modelName,
-    contents: JSON.stringify(segments),
-    config: {
-      systemInstruction: createSystemInstruction(categoryNames),
-      responseMimeType: "application/json",
-      responseSchema: RESPONSE_SCHEMA
-    }
-  });
+// --- PROVIDER CALLS ---
 
-  const jsonText = response.text;
-  if (!jsonText) throw new Error("No response from AI");
-  const parsed = JSON.parse(jsonText);
-  return parsed;
-};
+const callGemini = async (contents: string, systemInstruction: string) => {
+    const response = await ai.models.generateContent({
+        model: modelName,
+        contents: contents,
+        config: {
+          systemInstruction: systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA
+        }
+    });
+    const jsonText = response.text;
+    if (!jsonText) throw new Error("No response from AI");
+    return JSON.parse(jsonText);
+}
 
-const parseWithCustomProvider = async (segments: string[], categoryNames: string[], config: AIConfig): Promise<any> => {
-  try {
+const callCustomProvider = async (messages: any[], config: AIConfig) => {
     const response = await fetch(`${config.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -147,10 +148,7 @@ const parseWithCustomProvider = async (segments: string[], categoryNames: string
       },
       body: JSON.stringify({
         model: config.model,
-        messages: [
-          { role: 'system', content: getCustomSystemPrompt(categoryNames) },
-          { role: 'user', content: JSON.stringify(segments) }
-        ],
+        messages: messages,
       })
     });
 
@@ -164,22 +162,10 @@ const parseWithCustomProvider = async (segments: string[], categoryNames: string
     if (!content) throw new Error("Empty response from Custom Provider");
 
     const jsonString = content.replace(/```json\n?|```/g, '').trim();
-    
-    let parsed;
-    try {
-        parsed = JSON.parse(jsonString);
-    } catch (e) {
-        console.error("JSON Parse Error", jsonString);
-        throw new Error("Invalid JSON received from AI");
-    }
+    return JSON.parse(jsonString);
+}
 
-    return parsed;
-
-  } catch (error) {
-    console.error("Custom Provider Failed:", error);
-    throw error;
-  }
-};
+// --- MAIN PARSER ---
 
 export const parseSegmentsWithGemini = async (segments: string[], availableCategories: CategoryDef[], config?: AIConfig): Promise<PromptTag[]> => {
   if (segments.length === 0) return [];
@@ -190,21 +176,49 @@ export const parseSegmentsWithGemini = async (segments: string[], availableCateg
 
   try {
     let aiRawData: any;
+    let inputForAI: string = JSON.stringify(validSegments);
+    let systemPrompt = createStandardSystemInstruction(categoryNames);
 
-    if (config && config.useCustom && config.apiKey) {
-      aiRawData = await parseWithCustomProvider(validSegments, categoryNames, config);
-    } else {
-      aiRawData = await parseWithDefaultGemini(validSegments, categoryNames);
+    // 1. Check if Baidu Translation is Enabled
+    if (config?.baidu?.enabled && config.baidu.appId && config.baidu.secretKey) {
+        try {
+            // Attempt Baidu Translation
+            const baiduTranslations = await translateWithBaidu(validSegments, config.baidu);
+            
+            // If successful, construct a hybrid input for AI
+            // We pass { en: original, cn_hint: baidu_result }
+            const hybridInput = validSegments.map((seg, i) => ({
+                en: seg,
+                cn_hint: baiduTranslations[i]
+            }));
+            
+            inputForAI = JSON.stringify(hybridInput);
+            systemPrompt = createHybridSystemInstruction(categoryNames);
+            
+        } catch (baiduError) {
+            console.warn("Baidu Translation Failed, falling back to full AI:", baiduError);
+            // Fallback to standard prompt (inputForAI and systemPrompt remain default)
+        }
     }
 
-    // Merge AI data with Local Data (Syntax, Raw)
+    // 2. Call AI (Gemini or Custom)
+    if (config && config.useCustom && config.apiKey) {
+      aiRawData = await callCustomProvider([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: inputForAI }
+      ], config);
+    } else {
+      aiRawData = await callGemini(inputForAI, systemPrompt);
+    }
+
+    // 3. Normalize Results
     const normalizedTags = normalizeTags(aiRawData, validSegments);
 
-    // Assign temporary IDs
     return normalizedTags.map((tag: any, index: number) => ({
       ...tag,
       id: `temp-${Date.now()}-${index}`
     }));
+
   } catch (error) {
     console.error("AI Parsing Error:", error);
     throw error;
