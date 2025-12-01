@@ -68,17 +68,26 @@ const TagItem: React.FC<TagItemProps> = ({
   const isDraggable = typeof index === 'number' && !!onDragStart && !tag.isRefreshing;
 
   // 4. Text Display Logic
-  // If showTranslation is FALSE, we show the Translation as the MAIN text (if available) to save space/context.
-  // If showTranslation is TRUE, we show Raw/English as MAIN, and Translation as SUB.
-  const hasTranslation = tag.translation && tag.translation.trim() !== '' && tag.translation !== tag.raw;
+  const hasTranslation = tag.translation && tag.translation.trim() !== '' && tag.translation !== '...';
+  
+  // Prioritize englishText (Computed Prompt) over raw (Input) for main display
+  // Use raw as fallback if englishText is missing/loading
+  const mainContent = tag.englishText || tag.raw || 'Analyzing...';
   
   const mainText = (!showTranslation && hasTranslation) 
     ? tag.translation 
-    : (tag.raw || 'Analyzing...');
+    : mainContent;
 
-  const subText = (showTranslation && hasTranslation && !tag.disabled) 
-    ? tag.translation 
-    : null;
+  // Only show subtitle if:
+  // 1. Translation mode is ON
+  // 2. Translation exists
+  // 3. Translation is NOT identical to the main text (Avoid redundant "Girl / Girl" or "女孩 / 女孩")
+  const subText = (
+      showTranslation && 
+      hasTranslation && 
+      !tag.disabled && 
+      tag.translation.toLowerCase() !== mainText.toLowerCase()
+    ) ? tag.translation : null;
 
   return (
     <div 
@@ -100,7 +109,6 @@ const TagItem: React.FC<TagItemProps> = ({
     >
       {/* Smart Toolbar (Category + Actions) - Appears ABOVE the tag */}
       {!tag.isRefreshing && (
-        // Added pb-2 to create an invisible bridge for the mouse to travel from tag to buttons without losing hover
         <div className="absolute bottom-full left-0 right-0 flex justify-center pb-2 opacity-0 group-hover:opacity-100 transition-all duration-200 z-50 pointer-events-none group-hover:pointer-events-auto transform translate-y-2 group-hover:translate-y-0">
            <div className="flex items-center gap-0.5 bg-gray-900 border border-gray-600/80 rounded-md shadow-xl p-0.5">
               {/* Category Badge */}
@@ -147,8 +155,8 @@ const TagItem: React.FC<TagItemProps> = ({
         </div>
         
         {/* Translation Subtext */}
-        {!tag.isRefreshing && subText && (
-          <span className="text-[9px] opacity-60 font-sans mt-0.5 mix-blend-plus-lighter">
+        {subText && (
+          <span className={`text-[9px] opacity-60 font-sans mt-0.5 mix-blend-plus-lighter animate-in fade-in duration-300 ${tag.isRefreshing ? 'text-indigo-300' : ''}`}>
             {subText}
           </span>
         )}

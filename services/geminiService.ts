@@ -20,6 +20,9 @@ const detectSyntax = (text: string): SyntaxType => {
   return SyntaxType.NORMAL;
 };
 
+// Helper: Detect Chinese characters
+const isChinese = (text: string) => /[\u4e00-\u9fa5]/.test(text);
+
 // --- PROMPTS ---
 
 /**
@@ -46,23 +49,55 @@ Output JSON Keys:
 
 /**
  * HYBRID PROMPT: AI only does Classification (Translation provided by Baidu)
+ * Updated to handle Mixed Input (En->Zh and Zh->En)
  */
 const createHybridSystemInstruction = (categories: string[]) => `
-Task: Classify prompt segments based on provided text and translation.
+Task: Classify and Standardize ComfyUI prompt segments.
 
-Input: JSON Array of objects: { "en": "EnglishText", "cn_hint": "PreTranslatedText" }
+Input: JSON Array of objects: { "raw": "OriginalText", "trans_hint": "BaiduTranslation" }
 Output: JSON Array of objects.
 
 Rules:
-1. 'cat': Choose best fit from: [${categories.join(', ')}].
-2. 'en': Refine the English text if needed, usually keep as is.
-3. 'cn': Use the 'cn_hint' as the translation unless it is completely wrong.
+1. 'cat': Select best fit from: [${categories.join(', ')}].
+2. 'en' (English Prompt):
+   - If 'raw' contains Chinese, use 'trans_hint' (or improve it to be better English).
+   - If 'raw' is English, keep 'raw' exactly as is.
+3. 'cn' (Chinese Meaning):
+   - If 'raw' contains Chinese, use 'raw' as the meaning.
+   - If 'raw' is English, use 'trans_hint'.
 4. Maintain exact order.
 
 Output JSON Keys:
 - en: English Text
-- cn: Chinese Translation
+- cn: Chinese Translation (Must be Chinese)
 - cat: Category
+`;
+
+/**
+ * EXPANSION PROMPT: AI acts as a creative assistant
+ */
+const createExpansionSystemInstruction = () => `
+Task: You are an expert Stable Diffusion Prompt Assistant. 
+Your goal is to generate, expand, or rewrite prompt tags based on user instructions and context.
+
+Input JSON:
+{
+  "full_context": "The entire current prompt string",
+  "selected_text": "The specific part to modify (can be empty if inserting)",
+  "instruction": "User's request (e.g., 'make it cyberpunk', 'add lighting')"
+}
+
+Output: 
+Return ONLY the generated English prompt tags as a comma-separated string.
+Do not output Markdown, JSON, or explanations. Just the tags.
+
+Rules:
+1. Output MUST be in English.
+2. Use standard Danbooru-style tags (e.g., "1girl, cyberpunk, neon lights").
+3. If 'selected_text' is provided, your output will REPLACE it.
+4. If 'selected_text' is empty, your output will be INSERTED at the cursor.
+5. Consider the 'full_context' to ensure consistency (e.g., don't add '1girl' if there is already '1boy' unless instructed).
+6. High quality, detailed tags are preferred.
 `;
 
 const RESPONSE_SCHEMA = {
@@ -124,22 +159,25 @@ const normalizeTags = (aiResult: any, originalSegments: string[]): any[] => {
 
 // --- PROVIDER CALLS ---
 
-const callGemini = async (contents: string, systemInstruction: string) => {
+const callGemini = async (contents: string, systemInstruction: string, isJsonMode: boolean = true) => {
+    const config: any = {
+        systemInstruction: systemInstruction,
+    };
+    
+    if (isJsonMode) {
+        config.responseMimeType = "application/json";
+        config.responseSchema = RESPONSE_SCHEMA;
+    }
+
     const response = await ai.models.generateContent({
         model: modelName,
         contents: contents,
-        config: {
-          systemInstruction: systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: RESPONSE_SCHEMA
-        }
+        config: config
     });
-    const jsonText = response.text;
-    if (!jsonText) throw new Error("No response from AI");
-    return JSON.parse(jsonText);
+    return response.text;
 }
 
-const callCustomProvider = async (messages: any[], config: AIConfig) => {
+const callCustomProvider = async (messages: any[], config: AIConfig, isJsonMode: boolean = true) => {
     const response = await fetch(`${config.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -149,6 +187,9 @@ const callCustomProvider = async (messages: any[], config: AIConfig) => {
       body: JSON.stringify({
         model: config.model,
         messages: messages,
+        stream: false,
+        enable_thinking: false, 
+        temperature: 0.7
       })
     });
 
@@ -161,13 +202,61 @@ const callCustomProvider = async (messages: any[], config: AIConfig) => {
     
     if (!content) throw new Error("Empty response from Custom Provider");
 
-    const jsonString = content.replace(/```json\n?|```/g, '').trim();
-    return JSON.parse(jsonString);
+    if (isJsonMode) {
+        const jsonString = content.replace(/```json\n?|```/g, '').trim();
+        return JSON.parse(jsonString);
+    }
+    
+    return content;
 }
+
+// --- EXPANSION SERVICE ---
+
+export const expandPromptWithGemini = async (
+    fullContext: string,
+    selectedText: string,
+    instruction: string,
+    config?: AIConfig
+): Promise<string> => {
+    const systemPrompt = createExpansionSystemInstruction();
+    
+    const inputPayload = {
+        full_context: fullContext,
+        selected_text: selectedText,
+        instruction: instruction
+    };
+    
+    const inputString = JSON.stringify(inputPayload);
+
+    try {
+        let resultText = "";
+
+        if (config && config.useCustom && config.apiKey) {
+            resultText = await callCustomProvider([
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: inputString }
+            ], config, false); // False = Expect Text, not JSON structure
+        } else {
+            resultText = await callGemini(inputString, systemPrompt, false) || "";
+        }
+
+        // Cleanup response (remove quotes or markdown if any)
+        return resultText.replace(/^"|"$/g, '').trim();
+
+    } catch (error) {
+        console.error("AI Expansion Error:", error);
+        throw error;
+    }
+};
 
 // --- MAIN PARSER ---
 
-export const parseSegmentsWithGemini = async (segments: string[], availableCategories: CategoryDef[], config?: AIConfig): Promise<PromptTag[]> => {
+export const parseSegmentsWithGemini = async (
+    segments: string[], 
+    availableCategories: CategoryDef[], 
+    config?: AIConfig,
+    onProgress?: (translations: string[]) => void
+): Promise<PromptTag[]> => {
   if (segments.length === 0) return [];
 
   const categoryNames = availableCategories.map(c => c.name);
@@ -181,24 +270,66 @@ export const parseSegmentsWithGemini = async (segments: string[], availableCateg
 
     // 1. Check if Baidu Translation is Enabled
     if (config?.baidu?.enabled && config.baidu.appId && config.baidu.secretKey) {
+        console.groupCollapsed("Baidu Translation Check");
         try {
-            // Attempt Baidu Translation
-            const baiduTranslations = await translateWithBaidu(validSegments, config.baidu);
+            // Split segments based on language to optimize target language
+            const zhIndices: number[] = [];
+            const enIndices: number[] = [];
             
-            // If successful, construct a hybrid input for AI
-            // We pass { en: original, cn_hint: baidu_result }
+            validSegments.forEach((seg, idx) => {
+                if (isChinese(seg)) zhIndices.push(idx);
+                else enIndices.push(idx);
+            });
+
+            const baiduResults = new Array(validSegments.length).fill('');
+            const tasks = [];
+
+            // Task 1: Translate Chinese inputs to English (Zh -> En)
+            if (zhIndices.length > 0) {
+                const textsToTranslate = zhIndices.map(i => validSegments[i]);
+                tasks.push(
+                    translateWithBaidu(textsToTranslate, config.baidu, 'en')
+                        .then(res => {
+                            res.forEach((r, i) => baiduResults[zhIndices[i]] = r);
+                        })
+                );
+            }
+
+            // Task 2: Translate English inputs to Chinese (En -> Zh)
+            if (enIndices.length > 0) {
+                const textsToTranslate = enIndices.map(i => validSegments[i]);
+                tasks.push(
+                    translateWithBaidu(textsToTranslate, config.baidu, 'zh')
+                        .then(res => {
+                             res.forEach((r, i) => baiduResults[enIndices[i]] = r);
+                        })
+                );
+            }
+
+            await Promise.all(tasks);
+            console.log("Baidu Results (Merged):", baiduResults);
+            
+            // Immediate Callback: Show Baidu results on UI
+            if (onProgress) {
+                onProgress(baiduResults);
+            }
+            
+            // Construct Hybrid Input
             const hybridInput = validSegments.map((seg, i) => ({
-                en: seg,
-                cn_hint: baiduTranslations[i]
+                raw: seg,
+                trans_hint: baiduResults[i] || seg 
             }));
             
+            console.log("Hybrid Input for AI:", hybridInput);
+
             inputForAI = JSON.stringify(hybridInput);
             systemPrompt = createHybridSystemInstruction(categoryNames);
             
         } catch (baiduError) {
-            console.warn("Baidu Translation Failed, falling back to full AI:", baiduError);
-            // Fallback to standard prompt (inputForAI and systemPrompt remain default)
+            console.warn("Baidu Translation Failed, falling back to full AI. Reason:", baiduError);
+            // Fallback to standard prompt
         }
+        console.groupEnd();
     }
 
     // 2. Call AI (Gemini or Custom)
@@ -206,9 +337,10 @@ export const parseSegmentsWithGemini = async (segments: string[], availableCateg
       aiRawData = await callCustomProvider([
           { role: 'system', content: systemPrompt },
           { role: 'user', content: inputForAI }
-      ], config);
+      ], config, true);
     } else {
-      aiRawData = await callGemini(inputForAI, systemPrompt);
+      const responseText = await callGemini(inputForAI, systemPrompt, true);
+      if (responseText) aiRawData = JSON.parse(responseText);
     }
 
     // 3. Normalize Results

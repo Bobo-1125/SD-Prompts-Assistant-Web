@@ -1,13 +1,14 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette } from 'lucide-react';
-import { parseSegmentsWithGemini } from './services/geminiService';
+import { parseSegmentsWithGemini, expandPromptWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
 import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE, DictionaryEntry } from './types';
 import TagItem from './components/TagItem';
 import CategorySettings from './components/CategorySettings';
 import CollectionSidebar from './components/CollectionSidebar';
 import AddToCollectionModal from './components/AddToCollectionModal';
+import AIExpansionModal from './components/AIExpansionModal';
 
 const App: React.FC = () => {
   const [input, setInput] = useState<string>('');
@@ -45,6 +46,11 @@ const App: React.FC = () => {
   const [addToCollectionData, setAddToCollectionData] = useState<string>('');
   const [collectionRefreshTrigger, setCollectionRefreshTrigger] = useState<number>(0);
 
+  // AI Expansion State
+  const [showExpansionModal, setShowExpansionModal] = useState<boolean>(false);
+  const [expansionRange, setExpansionRange] = useState<{start: number, end: number, text: string} | null>(null);
+  const [isExpanding, setIsExpanding] = useState<boolean>(false);
+
   // Persist Configs
   useEffect(() => {
     localStorage.setItem('comfyui_ai_config', JSON.stringify(aiConfig));
@@ -70,6 +76,9 @@ const App: React.FC = () => {
 
   // Cache: Maps RAW segment text -> Parsed Tag Data
   const tagCache = useRef<Map<string, Omit<PromptTag, 'id'>>>(new Map());
+  
+  // Track previous tags to detect deletions and reset cache state
+  const prevTagsRef = useRef<PromptTag[]>([]);
 
   // Race Condition Fix: Track the latest input to prevent stale async updates
   const latestInputRef = useRef<string>(input);
@@ -331,11 +340,74 @@ const App: React.FC = () => {
       setTimeout(() => processInput(newText), 100);
   };
 
+  // --- AI Expansion Handlers ---
+  const handleExpansionRequest = (instruction: string) => {
+      if (!expansionRange) return;
+      setIsExpanding(true);
+
+      expandPromptWithGemini(input, expansionRange.text, instruction, aiConfig)
+        .then(newText => {
+            const el = textareaRef.current;
+            if (!el) return;
+
+            const originalText = input;
+            const prefix = originalText.substring(0, expansionRange.start);
+            const suffix = originalText.substring(expansionRange.end);
+
+            let finalTextToInsert = newText;
+            
+            // Logic for comma handling
+            if (expansionRange.start === expansionRange.end) {
+                 // Insertion mode: Check if we need commas
+                 if (prefix.trim() && !prefix.trim().endsWith(',')) finalTextToInsert = ', ' + finalTextToInsert;
+                 if (suffix.trim() && !suffix.trim().startsWith(',')) finalTextToInsert = finalTextToInsert + ', ';
+            }
+            
+            const updatedInput = prefix + finalTextToInsert + suffix;
+            setInput(updatedInput);
+            
+            // Move caret to end of inserted text
+            const newCaretPos = prefix.length + finalTextToInsert.length;
+             requestAnimationFrame(() => {
+                if (textareaRef.current) {
+                    textareaRef.current.selectionStart = newCaretPos;
+                    textareaRef.current.selectionEnd = newCaretPos;
+                    textareaRef.current.focus();
+                }
+            });
+
+            // Refresh analysis
+            processInput(updatedInput);
+            setShowExpansionModal(false);
+        })
+        .catch(err => {
+            alert("AI Expansion Failed: " + err.message);
+        })
+        .finally(() => {
+            setIsExpanding(false);
+        });
+  };
+
   // CORE LOGIC: Process input changes
   const processInput = useCallback(async (currentInput: string) => {
     const rawSegments = splitInputToSegments(currentInput);
+    
+    // DIFF Logic: Identify removed tags that were disabled and reset their cache status
+    const currentRawSet = new Set(rawSegments);
+    prevTagsRef.current.forEach(prevTag => {
+        // If a tag was previously disabled AND it is no longer in the current input
+        if (prevTag.disabled && !currentRawSet.has(prevTag.raw)) {
+            const cached = tagCache.current.get(prevTag.raw);
+            if (cached) {
+                // Reset disabled state to false so it re-appears enabled if typed again
+                tagCache.current.set(prevTag.raw, { ...cached, disabled: false });
+            }
+        }
+    });
+
     if (rawSegments.length === 0) {
       setTags([]);
+      prevTagsRef.current = [];
       return;
     }
 
@@ -386,13 +458,52 @@ const App: React.FC = () => {
     });
 
     setTags([...newTags]);
+    prevTagsRef.current = newTags; // Update reference for next diff
 
     // 2. Fetch missing segments from AI
     if (missingSegments.length > 0) {
       const uniqueMissing = Array.from(new Set(missingSegments));
       
       try {
-        const results = await parseSegmentsWithGemini(uniqueMissing, categories, aiConfig);
+        // Callback to show Baidu Results immediately
+        const onProgress = (translations: string[]) => {
+            // Race check: if input has changed, abandon update
+            if (latestInputRef.current !== currentInput) return;
+
+            setTags(prevTags => {
+                const nextTags = [...prevTags];
+                // Map uniqueMissing string -> translation
+                const transMap = new Map<string, string>();
+                uniqueMissing.forEach((seg, idx) => {
+                    if (translations[idx]) transMap.set(seg, translations[idx]);
+                });
+
+                // Update tags that are still refreshing and match the raw text
+                const updated = nextTags.map(t => {
+                    if (t.isRefreshing && transMap.has(t.raw)) {
+                        const hint = transMap.get(t.raw)!;
+                        // Check if hint is Chinese (implies En -> Zh translation occurred)
+                        // If hint is ASCII, it likely means we translated Zh -> En
+                        const isHintChinese = /[\u4e00-\u9fa5]/.test(hint);
+                        
+                        if (isHintChinese) {
+                             return { ...t, translation: hint };
+                        } else {
+                             // Hint is English (implies Zh -> En translation occurred)
+                             // Set English text for immediate feedback
+                             // And set translation to raw (original Chinese)
+                             return { ...t, englishText: hint, translation: t.raw };
+                        }
+                    }
+                    return t;
+                });
+                
+                prevTagsRef.current = updated;
+                return updated;
+            });
+        };
+
+        const results = await parseSegmentsWithGemini(uniqueMissing, categories, aiConfig, onProgress);
         const tagsToLearn: PromptTag[] = [];
 
         results.forEach(res => {
@@ -414,8 +525,6 @@ const App: React.FC = () => {
 
         // RACE CONDITION FIX:
         // Check if the input has changed while we were waiting for AI.
-        // If it has changed, we still cached the results above (so next run is fast),
-        // but we DO NOT update the UI state with this stale data.
         if (latestInputRef.current !== currentInput) {
              return;
         }
@@ -432,12 +541,17 @@ const App: React.FC = () => {
         });
 
         setTags(updatedTags);
+        prevTagsRef.current = updatedTags;
 
       } catch (error) {
         console.error("Failed to fetch segments", error);
         // Only turn off refreshing if we are still on the same input
         if (latestInputRef.current === currentInput) {
-            setTags(prev => prev.map(t => ({ ...t, isRefreshing: false })));
+            setTags(prev => {
+                const updated = prev.map(t => ({ ...t, isRefreshing: false }));
+                prevTagsRef.current = updated;
+                return updated;
+            });
         }
       }
     }
@@ -541,14 +655,28 @@ const App: React.FC = () => {
 
 
   const handleRemoveTag = (id: string) => {
+    const tagToRemove = tags.find(t => t.id === id);
+    if (tagToRemove) {
+        // Reset disabled status in cache immediately
+        const cached = tagCache.current.get(tagToRemove.raw);
+        if (cached) {
+            tagCache.current.set(tagToRemove.raw, { ...cached, disabled: false });
+        }
+    }
+    
     const newTags = tags.filter(t => t.id !== id);
     setTags(newTags);
     updateInputFromTags(newTags);
+    // processInput will run due to input change and update prevTagsRef
   };
 
   const handleToggleTag = (tag: PromptTag) => {
     const newStatus = !tag.disabled;
-    setTags(prev => prev.map(t => t.id === tag.id ? { ...t, disabled: newStatus } : t));
+    setTags(prev => {
+        const updated = prev.map(t => t.id === tag.id ? { ...t, disabled: newStatus } : t);
+        prevTagsRef.current = updated;
+        return updated;
+    });
     const cached = tagCache.current.get(tag.raw);
     if (cached) {
       tagCache.current.set(tag.raw, { ...cached, disabled: newStatus });
@@ -560,7 +688,21 @@ const App: React.FC = () => {
     tagCache.current.delete(tagToReload.raw);
 
     try {
-      const [result] = await parseSegmentsWithGemini([tagToReload.raw], categories, aiConfig);
+      const onProgress = (translations: string[]) => {
+           const hint = translations[0];
+           if (hint) {
+               const isHintChinese = /[\u4e00-\u9fa5]/.test(hint);
+               setTags(prev => prev.map(t => {
+                   if (t.id === tagToReload.id) {
+                       if (isHintChinese) return { ...t, translation: hint };
+                       else return { ...t, englishText: hint, translation: t.raw };
+                   }
+                   return t;
+               }));
+           }
+      };
+      
+      const [result] = await parseSegmentsWithGemini([tagToReload.raw], categories, aiConfig, onProgress);
       if (result) {
         tagCache.current.set(result.raw, {
             originalText: result.originalText,
@@ -572,7 +714,11 @@ const App: React.FC = () => {
             disabled: tagToReload.disabled
         });
         dictionaryService.learn({ ...result, id: 'temp' });
-        setTags(prev => prev.map(t => t.id === tagToReload.id ? { ...result, id: t.id, isRefreshing: false } : t));
+        setTags(prev => {
+            const updated = prev.map(t => t.id === tagToReload.id ? { ...result, id: t.id, isRefreshing: false } : t);
+            prevTagsRef.current = updated;
+            return updated;
+        });
       }
     } catch (e) {
       console.error(e);
@@ -596,6 +742,7 @@ const App: React.FC = () => {
     
     dragItem.current = index;
     setTags(newTags);
+    prevTagsRef.current = newTags;
   };
 
   const handleDragEnd = (e: React.DragEvent) => {
@@ -612,6 +759,7 @@ const App: React.FC = () => {
   const handleClear = () => {
     setInput('');
     setTags([]);
+    prevTagsRef.current = [];
     setSuggestions([]);
   };
 
@@ -723,6 +871,7 @@ const App: React.FC = () => {
         if (idsToToggle.size > 0) {
             const newTags = tags.map(t => idsToToggle.has(t.id) ? { ...t, disabled: !t.disabled } : t);
             setTags(newTags);
+            prevTagsRef.current = newTags;
             // Update cache
             newTags.forEach(t => {
                 if (idsToToggle.has(t.id)) {
@@ -770,6 +919,23 @@ const App: React.FC = () => {
             setShowAddToCollectionModal(true);
             setIsCollectionOpen(true); // Open collection popover to show context
         }
+    }
+
+    // 3. AI Expansion / Magic Rewrite (Ctrl + L)
+    if (isModifier && e.key === 'l') {
+        e.preventDefault();
+        const textarea = e.currentTarget;
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        
+        const selectedText = input.substring(start, end);
+        
+        setExpansionRange({
+            start,
+            end,
+            text: selectedText
+        });
+        setShowExpansionModal(true);
     }
   };
 
@@ -928,6 +1094,16 @@ const App: React.FC = () => {
         onSuccess={() => setCollectionRefreshTrigger(prev => prev + 1)}
       />
 
+      {/* AI Expansion Modal */}
+      <AIExpansionModal 
+        isOpen={showExpansionModal}
+        onClose={() => setShowExpansionModal(false)}
+        selectedText={expansionRange?.text || ''}
+        fullContext={input}
+        onConfirm={handleExpansionRequest}
+        isLoading={isExpanding}
+      />
+
       {/* Header */}
       <header className="flex items-center justify-between pb-4 border-b border-gray-800/50 relative z-40">
         <div className="flex items-center gap-3">
@@ -1001,7 +1177,7 @@ const App: React.FC = () => {
             </div>
             <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
               <Info size={10} />
-              {isInteractionMode ? '交互模式: 悬浮查看详情' : `Ctrl/Cmd+J 收藏 · Ctrl/Cmd+${shortcuts.toggleDisableKey} 禁用`}
+              {isInteractionMode ? '交互模式: 悬浮查看详情' : `Ctrl+J 收藏 · Ctrl+L AI扩写`}
             </div>
           </div>
           

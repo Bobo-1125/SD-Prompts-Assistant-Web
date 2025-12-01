@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { X, Plus, RotateCcw, Download, Trash, Database, Bot, LayoutGrid, Keyboard, Languages } from 'lucide-react';
+import { X, Plus, RotateCcw, Download, Trash, Database, Bot, LayoutGrid, Keyboard, Languages, Zap } from 'lucide-react';
 import { CategoryDef, COLOR_PALETTE, DEFAULT_CATEGORIES, AIConfig, ShortcutConfig } from '../types';
 import { dictionaryService } from '../services/dictionaryService';
 
@@ -66,6 +66,14 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
         ...aiConfig, 
         baidu: { ...aiConfig.baidu, [key]: value } 
     });
+  };
+
+  const applyPreset = (preset: 'silicon' | 'modelscope') => {
+      if (preset === 'silicon') {
+          handleAIConfigChange('baseUrl', 'https://api.siliconflow.cn/v1');
+      } else if (preset === 'modelscope') {
+          handleAIConfigChange('baseUrl', 'https://api-inference.modelscope.cn/v1');
+      }
   };
 
   return (
@@ -215,6 +223,20 @@ const CategorySettings: React.FC<CategorySettingsProps> = ({ categories, setCate
                         <div className="space-y-3 animate-in fade-in slide-in-from-top-2 bg-gray-800/30 p-3 rounded-lg border border-gray-800">
                             <div className="space-y-1">
                                 <label className="text-[10px] text-gray-500 uppercase font-bold">Base URL</label>
+                                <div className="flex gap-2 mb-2">
+                                     <button 
+                                        onClick={() => applyPreset('silicon')}
+                                        className="flex items-center gap-1 bg-gray-700 hover:bg-gray-600 text-[10px] px-2 py-1 rounded text-gray-300 transition-colors"
+                                     >
+                                        <Zap size={10} className="text-yellow-400" /> 硅基流动
+                                     </button>
+                                     <button 
+                                        onClick={() => applyPreset('modelscope')}
+                                        className="flex items-center gap-1 bg-gray-700 hover:bg-gray-600 text-[10px] px-2 py-1 rounded text-gray-300 transition-colors"
+                                     >
+                                        <Bot size={10} className="text-indigo-400" /> 魔搭社区
+                                     </button>
+                                </div>
                                 <input 
                                     type="text" 
                                     value={aiConfig.baseUrl}
