@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette } from 'lucide-react';
-import { parseSegmentsWithGemini, expandPromptWithGemini } from './services/geminiService';
+import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette, Tag } from 'lucide-react';
+import { translateSegments, classifySegments, expandPromptWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
 import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE, DictionaryEntry } from './types';
 import TagItem from './components/TagItem';
@@ -50,6 +50,9 @@ const App: React.FC = () => {
   const [showExpansionModal, setShowExpansionModal] = useState<boolean>(false);
   const [expansionRange, setExpansionRange] = useState<{start: number, end: number, text: string} | null>(null);
   const [isExpanding, setIsExpanding] = useState<boolean>(false);
+
+  // Classification State
+  const [isClassifying, setIsClassifying] = useState<boolean>(false);
 
   // Persist Configs
   useEffect(() => {
@@ -341,11 +344,11 @@ const App: React.FC = () => {
   };
 
   // --- AI Expansion Handlers ---
-  const handleExpansionRequest = (instruction: string) => {
+  const handleExpansionRequest = (instruction: string, systemPrompt: string) => {
       if (!expansionRange) return;
       setIsExpanding(true);
 
-      expandPromptWithGemini(input, expansionRange.text, instruction, aiConfig)
+      expandPromptWithGemini(input, expansionRange.text, instruction, systemPrompt, aiConfig)
         .then(newText => {
             const el = textareaRef.current;
             if (!el) return;
@@ -388,18 +391,16 @@ const App: React.FC = () => {
         });
   };
 
-  // CORE LOGIC: Process input changes
+  // CORE LOGIC: Process input changes (Translation Only via Baidu)
   const processInput = useCallback(async (currentInput: string) => {
     const rawSegments = splitInputToSegments(currentInput);
     
     // DIFF Logic: Identify removed tags that were disabled and reset their cache status
     const currentRawSet = new Set(rawSegments);
     prevTagsRef.current.forEach(prevTag => {
-        // If a tag was previously disabled AND it is no longer in the current input
         if (prevTag.disabled && !currentRawSet.has(prevTag.raw)) {
             const cached = tagCache.current.get(prevTag.raw);
             if (cached) {
-                // Reset disabled state to false so it re-appears enabled if typed again
                 tagCache.current.set(prevTag.raw, { ...cached, disabled: false });
             }
         }
@@ -450,7 +451,7 @@ const App: React.FC = () => {
           originalText: segment,
           englishText: segment,
           translation: '...',
-          category: '...',
+          category: '其他', // Default category for unclassified tags
           syntaxType: syntax,
           isRefreshing: true
         };
@@ -458,94 +459,157 @@ const App: React.FC = () => {
     });
 
     setTags([...newTags]);
-    prevTagsRef.current = newTags; // Update reference for next diff
+    prevTagsRef.current = newTags;
 
-    // 2. Fetch missing segments from AI
+    // 2. Fetch missing translations (BAIDU ONLY)
     if (missingSegments.length > 0) {
       const uniqueMissing = Array.from(new Set(missingSegments));
       
       try {
-        // Callback to show Baidu Results immediately
-        const onProgress = (translations: string[]) => {
-            // Race check: if input has changed, abandon update
-            if (latestInputRef.current !== currentInput) return;
-
-            setTags(prevTags => {
-                const nextTags = [...prevTags];
-                // Map uniqueMissing string -> translation
-                const transMap = new Map<string, string>();
-                uniqueMissing.forEach((seg, idx) => {
-                    if (translations[idx]) transMap.set(seg, translations[idx]);
-                });
-
-                // Update tags that are still refreshing and match the raw text
-                const updated = nextTags.map(t => {
-                    if (t.isRefreshing && transMap.has(t.raw)) {
-                        const hint = transMap.get(t.raw)!;
-                        // Check if hint is Chinese (implies En -> Zh translation occurred)
-                        // If hint is ASCII, it likely means we translated Zh -> En
-                        const isHintChinese = /[\u4e00-\u9fa5]/.test(hint);
-                        
-                        if (isHintChinese) {
-                             return { ...t, translation: hint };
-                        } else {
-                             // Hint is English (implies Zh -> En translation occurred)
-                             // Set English text for immediate feedback
-                             // And set translation to raw (original Chinese)
-                             return { ...t, englishText: hint, translation: t.raw };
-                        }
-                    }
-                    return t;
-                });
-                
-                prevTagsRef.current = updated;
-                return updated;
-            });
-        };
-
-        const results = await parseSegmentsWithGemini(uniqueMissing, categories, aiConfig, onProgress);
-        const tagsToLearn: PromptTag[] = [];
-
-        results.forEach(res => {
-          const tagData = {
-            originalText: res.originalText,
-            englishText: res.englishText,
-            translation: res.translation,
-            category: res.category,
-            syntaxType: res.syntaxType,
-            raw: res.raw,
-            disabled: false 
-          };
-
-          tagCache.current.set(res.raw, tagData);
-          tagsToLearn.push({ ...tagData, id: 'temp' });
-        });
-        
-        dictionaryService.learnBatch(tagsToLearn);
+        // Use the new translateSegments function which ONLY does translation
+        const results = await translateSegments(uniqueMissing, aiConfig);
 
         // RACE CONDITION FIX:
-        // Check if the input has changed while we were waiting for AI.
         if (latestInputRef.current !== currentInput) {
              return;
         }
 
         const updatedTags = [...newTags];
-        missingSegmentIndices.forEach(index => {
-          const segmentRaw = rawSegments[index];
-          const cached = tagCache.current.get(segmentRaw);
-          if (cached) {
-            updatedTags[index] = { ...cached, id: updatedTags[index].id, isRefreshing: false };
-          } else {
-             updatedTags[index] = { ...updatedTags[index], isRefreshing: false, category: 'Unknown' };
-          }
-        });
+        const replacements = new Map<number, string>(); // index -> new text
+        let needsCursorAdjustment = false;
+        let cursorAdjustment = 0;
 
+        results.forEach(res => {
+          // Update Cache
+          const tagData = {
+            originalText: res.originalText,
+            englishText: res.englishText,
+            translation: res.translation,
+            category: '其他', // Baidu doesn't classify
+            syntaxType: res.syntaxType,
+            raw: res.raw,
+            disabled: false,
+            isRefreshing: false
+          };
+          
+          tagCache.current.set(res.raw, tagData);
+        });
+        
+        // Auto-Replace Logic (If Chinese Mode is ON)
+        if (isInputChinese) {
+             missingSegmentIndices.forEach(index => {
+                const rawSeg = rawSegments[index];
+                // Find result for this segment
+                const res = results.find(r => r.originalText === rawSeg);
+                if (res && res.translation === res.raw) {
+                    // This means result is Chinese (translation == raw).
+                    // BUT our input was English (otherwise we wouldn't be translating to Chinese in this logic branch typically, 
+                    // unless mixed input. Let's rely on translateSegments behavior).
+                    
+                    // Actually, translateSegments sets 'raw' to the result of translation if we need to swap?
+                    // No, translateSegments returns 'englishText' and 'translation'.
+                    // If we are in Chinese Mode, we want the input text to be Chinese.
+                    
+                    if (res.translation !== rawSeg) {
+                        // Translation is different from input, so we should update input to be translation
+                        replacements.set(index, res.translation);
+                        
+                        // Also update cache for the NEW Chinese key
+                        const newTagData = {
+                            originalText: res.originalText,
+                            englishText: res.englishText,
+                            translation: res.translation,
+                            category: '其他',
+                            syntaxType: res.syntaxType,
+                            raw: res.translation, // The new raw is the Chinese text
+                            disabled: false,
+                            isRefreshing: false
+                        };
+                        tagCache.current.set(res.translation, newTagData);
+                    }
+                }
+             });
+        }
+
+        // Apply input replacements if any
+        if (replacements.size > 0 && textareaRef.current) {
+            let newInput = currentInput;
+            const sortedIndices = Array.from(replacements.keys()).sort((a, b) => b - a); // Replace from end to start
+            
+            // Re-split to find exact ranges
+            // This is tricky because splitting by regex loses exact delimiter positions if we are not careful.
+            // A safer way is to reconstruct.
+            
+            // Let's use a simpler approach: Reconstruct the whole string from segments + delimiters? 
+            // Hard because splitInputToSegments consumes delimiters.
+            
+            // Alternative: We wait for user to stop typing? No, this is onProgress/completion.
+            
+            // Let's iterate and replace.
+            const parts = currentInput.split(/([,，\n]+)/);
+            let segIdx = 0;
+            let currentPos = 0;
+            const oldSelectionStart = textareaRef.current.selectionStart;
+
+            const newParts = parts.map(part => {
+                if (part.match(/^[,，\n]+$/) || !part.trim()) {
+                    currentPos += part.length;
+                    return part;
+                }
+                
+                const currentIdx = segIdx++;
+                if (replacements.has(currentIdx)) {
+                    const newText = replacements.get(currentIdx)!;
+                    const diff = newText.length - part.length;
+                    
+                    if (currentPos < oldSelectionStart) {
+                        cursorAdjustment += diff;
+                    }
+                    currentPos += part.length;
+                    return newText;
+                }
+                currentPos += part.length;
+                return part;
+            });
+            
+            const finalInput = newParts.join('');
+            if (finalInput !== currentInput) {
+                setInput(finalInput);
+                latestInputRef.current = finalInput;
+                needsCursorAdjustment = true;
+                
+                // We need to re-run processInput on the new input, but we can do it locally
+                // For now, let's just trigger setInput and let the effect chain handle it?
+                // Better to update tags immediately to avoid flicker.
+                
+                // Actually, let's skip tag update here and let the `useEffect` on `input` trigger `processInput` again.
+                // It will hit cache for the new chinese keys we just set.
+                
+                requestAnimationFrame(() => {
+                    if (textareaRef.current) {
+                        const newCursor = oldSelectionStart + cursorAdjustment;
+                        textareaRef.current.selectionStart = newCursor;
+                        textareaRef.current.selectionEnd = newCursor;
+                    }
+                });
+                return; // Exit here, let the new input trigger processInput
+            }
+        }
+
+        // Update current view tags (If no replacements occurred)
+        missingSegmentIndices.forEach(index => {
+            const segmentRaw = rawSegments[index];
+            const cached = tagCache.current.get(segmentRaw);
+            if (cached) {
+                updatedTags[index] = { ...cached, id: updatedTags[index].id };
+            }
+        });
+        
         setTags(updatedTags);
         prevTagsRef.current = updatedTags;
 
       } catch (error) {
-        console.error("Failed to fetch segments", error);
-        // Only turn off refreshing if we are still on the same input
+        console.error("Translation Failed", error);
         if (latestInputRef.current === currentInput) {
             setTags(prev => {
                 const updated = prev.map(t => ({ ...t, isRefreshing: false }));
@@ -555,7 +619,68 @@ const App: React.FC = () => {
         }
       }
     }
-  }, [categories, aiConfig]);
+  }, [categories, aiConfig, isInputChinese]); // Added isInputChinese dependency
+
+  // --- Auto Classify Handler ---
+  const handleAutoClassify = async () => {
+    // Find tags that need classification (category === '其他' or 'Other')
+    const unclassifiedTags = tags.filter(t => 
+        !t.disabled && (t.category === '其他' || t.category === 'Other')
+    );
+
+    if (unclassifiedTags.length === 0) return;
+
+    setIsClassifying(true);
+    setTags(prev => prev.map(t => 
+        unclassifiedTags.some(u => u.id === t.id) ? { ...t, isRefreshing: true } : t
+    ));
+
+    try {
+        const uniqueToClassify: string[] = Array.from(new Set(unclassifiedTags.map(t => t.englishText)));
+        
+        // Prepare simplified objects for the service
+        const objectsToClassify = uniqueToClassify.map(text => ({ englishText: text }));
+        
+        const categoriesResult = await classifySegments(objectsToClassify, categories, aiConfig);
+
+        const categoryMap = new Map<string, string>();
+        uniqueToClassify.forEach((text, i) => {
+            categoryMap.set(text, categoriesResult[i]);
+        });
+
+        // Update state and cache
+        setTags(prev => {
+            const updated = prev.map(t => {
+                if (t.isRefreshing && categoryMap.has(t.englishText)) {
+                    const newCat = categoryMap.get(t.englishText)!;
+                    
+                    // Update cache as well
+                    const cached = tagCache.current.get(t.raw);
+                    if (cached) {
+                        const newCached = { ...cached, category: newCat };
+                        tagCache.current.set(t.raw, newCached);
+                        
+                        // Learn valid classifications
+                        dictionaryService.learn({ ...newCached, id: 'temp' });
+                    }
+
+                    return { ...t, category: newCat, isRefreshing: false };
+                }
+                if (t.isRefreshing) return { ...t, isRefreshing: false }; // Failed or skipped
+                return t;
+            });
+            prevTagsRef.current = updated;
+            return updated;
+        });
+
+    } catch (e) {
+        console.error("Auto Classification Failed", e);
+        setTags(prev => prev.map(t => ({ ...t, isRefreshing: false })));
+    } finally {
+        setIsClassifying(false);
+    }
+  };
+
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const val = e.target.value;
@@ -684,38 +809,28 @@ const App: React.FC = () => {
   };
 
   const handleReloadTag = async (tagToReload: PromptTag) => {
+    // For reload, we use the pure translation logic again (or we could enable full AI if desired)
+    // Based on user request "Translation completely via Baidu", let's stick to translateSegments.
     setTags(prev => prev.map(t => t.id === tagToReload.id ? { ...t, isRefreshing: true } : t));
     tagCache.current.delete(tagToReload.raw);
 
     try {
-      const onProgress = (translations: string[]) => {
-           const hint = translations[0];
-           if (hint) {
-               const isHintChinese = /[\u4e00-\u9fa5]/.test(hint);
-               setTags(prev => prev.map(t => {
-                   if (t.id === tagToReload.id) {
-                       if (isHintChinese) return { ...t, translation: hint };
-                       else return { ...t, englishText: hint, translation: t.raw };
-                   }
-                   return t;
-               }));
-           }
-      };
+      const [result] = await translateSegments([tagToReload.raw], aiConfig);
       
-      const [result] = await parseSegmentsWithGemini([tagToReload.raw], categories, aiConfig, onProgress);
       if (result) {
-        tagCache.current.set(result.raw, {
+        const newData = {
             originalText: result.originalText,
             englishText: result.englishText,
             translation: result.translation,
-            category: result.category,
+            category: '其他', // Reset category on reload, or keep previous? Resetting is safer.
             syntaxType: result.syntaxType,
             raw: result.raw,
             disabled: tagToReload.disabled
-        });
-        dictionaryService.learn({ ...result, id: 'temp' });
+        };
+        tagCache.current.set(result.raw, newData);
+        
         setTags(prev => {
-            const updated = prev.map(t => t.id === tagToReload.id ? { ...result, id: t.id, isRefreshing: false } : t);
+            const updated = prev.map(t => t.id === tagToReload.id ? { ...newData, id: t.id, isRefreshing: false } : t);
             prevTagsRef.current = updated;
             return updated;
         });
@@ -1135,7 +1250,7 @@ const App: React.FC = () => {
                 <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
                 ComfyUI 提示词助手
                 </h1>
-                <p className="text-xs text-gray-500">双向绑定 · 智能增量解析 · 本地词库加速</p>
+                <p className="text-xs text-gray-500">纯百度翻译加速 · 按需 AI 分类</p>
             </div>
           </div>
         </div>
@@ -1234,6 +1349,24 @@ const App: React.FC = () => {
            <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">结构化标签 (Structured Tags)</h2>
             <div className="flex items-center gap-2">
+              <button 
+                onClick={handleAutoClassify}
+                disabled={isClassifying || tags.length === 0}
+                className={`
+                    flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all border
+                    ${isClassifying 
+                        ? 'bg-purple-900/50 border-purple-500/30 text-purple-300 cursor-wait'
+                        : 'bg-purple-600 hover:bg-purple-500 border-purple-400 text-white shadow-lg shadow-purple-900/40'
+                    }
+                `}
+                title="对未分类的标签进行 AI 智能分类"
+              >
+                 {isClassifying ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12} />}
+                 {isClassifying ? '分类中...' : 'AI 智能分类'}
+              </button>
+
+              <div className="h-4 w-[1px] bg-gray-700 mx-1"></div>
+
               <button 
                 onClick={() => setShowTranslation(!showTranslation)}
                 className={`p-1.5 rounded-full transition-colors ${showTranslation ? 'text-indigo-400 bg-indigo-900/30' : 'text-gray-500 hover:text-gray-300'}`}

@@ -83,6 +83,16 @@ export interface CollectionNode {
 }
 // ----------------------------
 
+// --- Expansion Preset Types ---
+export interface ExpansionPreset {
+  id: string;
+  name: string;
+  description?: string;
+  systemPrompt: string;
+  isDefault?: boolean; // If true, cannot be deleted (but can be edited, maybe reset)
+}
+// ------------------------------
+
 export const COLOR_PALETTE = [
   { name: 'blue', value: 'bg-blue-900/40 border-blue-700/50 text-blue-200' },
   { name: 'purple', value: 'bg-purple-900/40 border-purple-700/50 text-purple-200' },

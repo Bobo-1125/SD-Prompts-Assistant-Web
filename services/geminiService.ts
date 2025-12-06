@@ -8,6 +8,10 @@ const ai = new GoogleGenAI({ apiKey });
 
 const modelName = "gemini-2.5-flash";
 
+// Safe batch size to prevent AI from losing count. 
+// 10-15 is usually the sweet spot for strict list mapping.
+const CLASSIFICATION_BATCH_SIZE = 12;
+
 /**
  * Local Helper: Detect syntax type using Regex.
  * Much faster and more reliable than AI.
@@ -23,139 +27,35 @@ const detectSyntax = (text: string): SyntaxType => {
 // Helper: Detect Chinese characters
 const isChinese = (text: string) => /[\u4e00-\u9fa5]/.test(text);
 
+// Helper: Chunk array
+const chunkArray = <T>(array: T[], size: number): T[][] => {
+    const chunked: T[][] = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunked.push(array.slice(i, i + size));
+    }
+    return chunked;
+};
+
 // --- PROMPTS ---
 
 /**
- * STANDARD PROMPT: AI does Translation + Classification
+ * CLASSIFICATION ONLY PROMPT
  */
-const createStandardSystemInstruction = (categories: string[]) => `
-Task: Translate and Classify ComfyUI prompt segments.
+const createClassificationSystemInstruction = (categories: string[], count: number) => `
+Task: Classify ComfyUI prompt tags into categories.
 
-Input: JSON Array of strings.
-Output: JSON Array of objects.
+Categories: [${categories.join(', ')}]
+
+Input: JSON Array of ${count} English prompt strings.
+Output: JSON Array of EXACTLY ${count} strings (Category Names).
 
 Rules:
-1. Maintain exact order.
-2. 'cat': Choose best fit from: [${categories.join(', ')}].
-3. 'en': English prompt. (Translate if input is Chinese).
-4. 'cn': Chinese meaning. (Translate if input is English).
-5. If segment is LoRA (<...>) or Dynamic ({...}), keep 'en' as is, just provide meaning in 'cn'.
-
-Output JSON Keys:
-- en: English Text
-- cn: Chinese Translation
-- cat: Category
+1. Return ONLY the category name for each input string.
+2. Maintain EXACT order. Input[0] -> Output[0].
+3. If unsure, use "其他" (or 'Other').
+4. Do NOT output objects, just an array of strings.
+5. Do NOT skip any items.
 `;
-
-/**
- * HYBRID PROMPT: AI only does Classification (Translation provided by Baidu)
- * Updated to handle Mixed Input (En->Zh and Zh->En)
- */
-const createHybridSystemInstruction = (categories: string[]) => `
-Task: Classify and Standardize ComfyUI prompt segments.
-
-Input: JSON Array of objects: { "raw": "OriginalText", "trans_hint": "BaiduTranslation" }
-Output: JSON Array of objects.
-
-Rules:
-1. 'cat': Select best fit from: [${categories.join(', ')}].
-2. 'en' (English Prompt):
-   - If 'raw' contains Chinese, use 'trans_hint' (or improve it to be better English).
-   - If 'raw' is English, keep 'raw' exactly as is.
-3. 'cn' (Chinese Meaning):
-   - If 'raw' contains Chinese, use 'raw' as the meaning.
-   - If 'raw' is English, use 'trans_hint'.
-4. Maintain exact order.
-
-Output JSON Keys:
-- en: English Text
-- cn: Chinese Translation (Must be Chinese)
-- cat: Category
-`;
-
-/**
- * EXPANSION PROMPT: AI acts as a creative assistant
- */
-const createExpansionSystemInstruction = () => `
-Task: You are an expert Stable Diffusion Prompt Assistant. 
-Your goal is to generate, expand, or rewrite prompt tags based on user instructions and context.
-
-Input JSON:
-{
-  "full_context": "The entire current prompt string",
-  "selected_text": "The specific part to modify (can be empty if inserting)",
-  "instruction": "User's request (e.g., 'make it cyberpunk', 'add lighting')"
-}
-
-Output: 
-Return ONLY the generated English prompt tags as a comma-separated string.
-Do not output Markdown, JSON, or explanations. Just the tags.
-
-Rules:
-1. Output MUST be in English.
-2. Use standard Danbooru-style tags (e.g., "1girl, cyberpunk, neon lights").
-3. If 'selected_text' is provided, your output will REPLACE it.
-4. If 'selected_text' is empty, your output will be INSERTED at the cursor.
-5. Consider the 'full_context' to ensure consistency (e.g., don't add '1girl' if there is already '1boy' unless instructed).
-6. High quality, detailed tags are preferred.
-`;
-
-const RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    tags: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          en: { type: Type.STRING },
-          cn: { type: Type.STRING },
-          cat: { type: Type.STRING }
-        },
-        required: ["en", "cn", "cat"]
-      }
-    }
-  }
-};
-
-/**
- * Helper to normalize AI response and merge with Original Segments
- */
-const normalizeTags = (aiResult: any, originalSegments: string[]): any[] => {
-  let resultList: any[] = [];
-
-  // Handle various AI return structures
-  if (aiResult.tags && Array.isArray(aiResult.tags)) {
-    resultList = aiResult.tags;
-  } else if (Array.isArray(aiResult)) {
-    resultList = aiResult;
-  } else if (typeof aiResult === 'object' && aiResult !== null) {
-    resultList = [aiResult];
-  }
-
-  // Map back to original segments by index
-  return originalSegments.map((segment, index) => {
-    // If AI missed a segment (rare), provide fallback
-    const item = resultList[index] || {};
-    
-    // Support both old keys (compatibility) and new minified keys
-    const englishText = item.en || item.englishText || segment;
-    const translation = item.cn || item.translation || segment;
-    const category = item.cat || item.category || '其他';
-    
-    // Compute Syntax Locally
-    const syntaxType = detectSyntax(segment);
-
-    return {
-      originalText: segment,
-      englishText: englishText,
-      translation: translation,
-      category: category,
-      syntaxType: syntaxType, // Computed locally
-      raw: segment // From input
-    };
-  });
-};
 
 // --- PROVIDER CALLS ---
 
@@ -166,7 +66,6 @@ const callGemini = async (contents: string, systemInstruction: string, isJsonMod
     
     if (isJsonMode) {
         config.responseMimeType = "application/json";
-        config.responseSchema = RESPONSE_SCHEMA;
     }
 
     const response = await ai.models.generateContent({
@@ -189,7 +88,7 @@ const callCustomProvider = async (messages: any[], config: AIConfig, isJsonMode:
         messages: messages,
         stream: false,
         enable_thinking: false, 
-        temperature: 0.7
+        temperature: 0.1 // Lower temperature for classification stability
       })
     });
 
@@ -210,16 +109,158 @@ const callCustomProvider = async (messages: any[], config: AIConfig, isJsonMode:
     return content;
 }
 
+// --- NEW SERVICES ---
+
+/**
+ * 1. Translate Only (Uses Baidu, NO AI)
+ */
+export const translateSegments = async (
+    segments: string[],
+    config: AIConfig
+): Promise<any[]> => {
+    if (segments.length === 0) return [];
+    
+    const results = segments.map(seg => ({
+        originalText: seg,
+        englishText: seg, // Default to self
+        translation: seg, // Default to self
+        category: '其他',
+        syntaxType: detectSyntax(seg),
+        raw: seg
+    }));
+
+    // If Baidu is disabled or missing keys, return raw results immediately
+    if (!config?.baidu?.enabled || !config.baidu.appId || !config.baidu.secretKey) {
+        return results;
+    }
+
+    try {
+        const zhIndices: number[] = [];
+        const enIndices: number[] = [];
+        
+        segments.forEach((seg, idx) => {
+            if (isChinese(seg)) zhIndices.push(idx);
+            else enIndices.push(idx);
+        });
+
+        const tasks = [];
+        const translatedValues = new Array(segments.length).fill(null);
+
+        // Zh -> En
+        if (zhIndices.length > 0) {
+            const texts = zhIndices.map(i => segments[i]);
+            tasks.push(
+                translateWithBaidu(texts, config.baidu, 'en')
+                .then(res => res.forEach((r, i) => translatedValues[zhIndices[i]] = { text: r, from: 'zh' }))
+            );
+        }
+
+        // En -> Zh
+        if (enIndices.length > 0) {
+            const texts = enIndices.map(i => segments[i]);
+            tasks.push(
+                translateWithBaidu(texts, config.baidu, 'zh')
+                .then(res => res.forEach((r, i) => translatedValues[enIndices[i]] = { text: r, from: 'en' }))
+            );
+        }
+
+        await Promise.all(tasks);
+
+        // Merge results
+        translatedValues.forEach((item, i) => {
+            if (item) {
+                if (item.from === 'zh') {
+                    // Was Chinese input, Translated to English
+                    results[i].englishText = item.text; // The translation is the prompt
+                    results[i].translation = segments[i]; // The original is the meaning
+                } else {
+                    // Was English input, Translated to Chinese
+                    results[i].englishText = segments[i]; // The original is the prompt
+                    results[i].translation = item.text; // The translation is the meaning
+                }
+            }
+        });
+
+    } catch (e) {
+        console.error("Baidu Translation Error:", e);
+        // Fallback: results are already populated with raw text
+    }
+
+    return results;
+};
+
+/**
+ * 2. Classify Only (Uses AI) - BATCHED
+ */
+export const classifySegments = async (
+    tags: { englishText: string }[],
+    availableCategories: CategoryDef[],
+    config?: AIConfig
+): Promise<string[]> => {
+    if (tags.length === 0) return [];
+
+    const categoryNames = availableCategories.map(c => c.name);
+    
+    // Chunk input to avoid AI losing count
+    const chunks = chunkArray(tags, CLASSIFICATION_BATCH_SIZE);
+    
+    // Process chunks in parallel (or sequential if rate limits are tight)
+    const chunkPromises = chunks.map(async (chunk) => {
+        const inputs = chunk.map(t => t.englishText);
+        const inputString = JSON.stringify(inputs);
+        const systemPrompt = createClassificationSystemInstruction(categoryNames, inputs.length);
+
+        try {
+            let aiResult: string[] = [];
+
+            if (config && config.useCustom && config.apiKey) {
+                 aiResult = await callCustomProvider([
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: inputString }
+                ], config, true);
+            } else {
+                const responseText = await callGemini(inputString, systemPrompt, true);
+                if (responseText) aiResult = JSON.parse(responseText);
+            }
+
+            // Validation: Ensure array length matches input length
+            if (!Array.isArray(aiResult)) {
+                console.warn("AI returned non-array for classification");
+                return new Array(inputs.length).fill('其他');
+            }
+
+            // If length mismatch, pad with '其他' to maintain alignment for future chunks
+            if (aiResult.length !== inputs.length) {
+                console.warn(`AI classification mismatch. Expected ${inputs.length}, got ${aiResult.length}. Padding results.`);
+                const padded = [...aiResult];
+                while (padded.length < inputs.length) padded.push('其他');
+                return padded.slice(0, inputs.length); // Trim if too long (unlikely)
+            }
+
+            // Normalize results against valid categories
+            return aiResult.map(cat => categoryNames.includes(cat) ? cat : '其他');
+
+        } catch (error) {
+            console.error("AI Classification Chunk Error:", error);
+            return new Array(inputs.length).fill('其他');
+        }
+    });
+
+    const resultsArray = await Promise.all(chunkPromises);
+    
+    // Flatten results
+    return resultsArray.flat();
+};
+
 // --- EXPANSION SERVICE ---
 
 export const expandPromptWithGemini = async (
     fullContext: string,
     selectedText: string,
     instruction: string,
+    systemInstruction: string, // Changed: Now passed dynamically
     config?: AIConfig
 ): Promise<string> => {
-    const systemPrompt = createExpansionSystemInstruction();
-    
     const inputPayload = {
         full_context: fullContext,
         selected_text: selectedText,
@@ -233,132 +274,17 @@ export const expandPromptWithGemini = async (
 
         if (config && config.useCustom && config.apiKey) {
             resultText = await callCustomProvider([
-                { role: 'system', content: systemPrompt },
+                { role: 'system', content: systemInstruction },
                 { role: 'user', content: inputString }
-            ], config, false); // False = Expect Text, not JSON structure
+            ], config, false); 
         } else {
-            resultText = await callGemini(inputString, systemPrompt, false) || "";
+            resultText = await callGemini(inputString, systemInstruction, false) || "";
         }
 
-        // Cleanup response (remove quotes or markdown if any)
         return resultText.replace(/^"|"$/g, '').trim();
 
     } catch (error) {
         console.error("AI Expansion Error:", error);
         throw error;
     }
-};
-
-// --- MAIN PARSER ---
-
-export const parseSegmentsWithGemini = async (
-    segments: string[], 
-    availableCategories: CategoryDef[], 
-    config?: AIConfig,
-    onProgress?: (translations: string[]) => void
-): Promise<PromptTag[]> => {
-  if (segments.length === 0) return [];
-
-  const categoryNames = availableCategories.map(c => c.name);
-  const validSegments = segments.filter(s => s.trim().length > 0);
-  if (validSegments.length === 0) return [];
-
-  try {
-    let aiRawData: any;
-    let inputForAI: string = JSON.stringify(validSegments);
-    let systemPrompt = createStandardSystemInstruction(categoryNames);
-
-    // 1. Check if Baidu Translation is Enabled
-    if (config?.baidu?.enabled && config.baidu.appId && config.baidu.secretKey) {
-        console.groupCollapsed("Baidu Translation Check");
-        try {
-            // Split segments based on language to optimize target language
-            const zhIndices: number[] = [];
-            const enIndices: number[] = [];
-            
-            validSegments.forEach((seg, idx) => {
-                if (isChinese(seg)) zhIndices.push(idx);
-                else enIndices.push(idx);
-            });
-
-            const baiduResults = new Array(validSegments.length).fill('');
-            const tasks = [];
-
-            // Task 1: Translate Chinese inputs to English (Zh -> En)
-            if (zhIndices.length > 0) {
-                const textsToTranslate = zhIndices.map(i => validSegments[i]);
-                tasks.push(
-                    translateWithBaidu(textsToTranslate, config.baidu, 'en')
-                        .then(res => {
-                            res.forEach((r, i) => baiduResults[zhIndices[i]] = r);
-                        })
-                );
-            }
-
-            // Task 2: Translate English inputs to Chinese (En -> Zh)
-            if (enIndices.length > 0) {
-                const textsToTranslate = enIndices.map(i => validSegments[i]);
-                tasks.push(
-                    translateWithBaidu(textsToTranslate, config.baidu, 'zh')
-                        .then(res => {
-                             res.forEach((r, i) => baiduResults[enIndices[i]] = r);
-                        })
-                );
-            }
-
-            await Promise.all(tasks);
-            console.log("Baidu Results (Merged):", baiduResults);
-            
-            // Immediate Callback: Show Baidu results on UI
-            if (onProgress) {
-                onProgress(baiduResults);
-            }
-            
-            // Construct Hybrid Input
-            const hybridInput = validSegments.map((seg, i) => ({
-                raw: seg,
-                trans_hint: baiduResults[i] || seg 
-            }));
-            
-            console.log("Hybrid Input for AI:", hybridInput);
-
-            inputForAI = JSON.stringify(hybridInput);
-            systemPrompt = createHybridSystemInstruction(categoryNames);
-            
-        } catch (baiduError) {
-            console.warn("Baidu Translation Failed, falling back to full AI. Reason:", baiduError);
-            // Fallback to standard prompt
-        }
-        console.groupEnd();
-    }
-
-    // 2. Call AI (Gemini or Custom)
-    if (config && config.useCustom && config.apiKey) {
-      aiRawData = await callCustomProvider([
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: inputForAI }
-      ], config, true);
-    } else {
-      const responseText = await callGemini(inputForAI, systemPrompt, true);
-      if (responseText) aiRawData = JSON.parse(responseText);
-    }
-
-    // 3. Normalize Results
-    const normalizedTags = normalizeTags(aiRawData, validSegments);
-
-    return normalizedTags.map((tag: any, index: number) => ({
-      ...tag,
-      id: `temp-${Date.now()}-${index}`
-    }));
-
-  } catch (error) {
-    console.error("AI Parsing Error:", error);
-    throw error;
-  }
-};
-
-export const parsePromptWithGemini = async (input: string, availableCategories: CategoryDef[], config?: AIConfig): Promise<{ tags: PromptTag[] }> => {
-    const segments = input.split(/,|，/).map(s => s.trim()).filter(s => s);
-    const tags = await parseSegmentsWithGemini(segments, availableCategories, config);
-    return { tags };
 };
