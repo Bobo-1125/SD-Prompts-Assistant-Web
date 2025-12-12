@@ -1,6 +1,6 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette, Tag, Undo2, Redo2 } from 'lucide-react';
+import { Wand2, Copy, Trash2, Layers, CheckCircle2, Loader2, Info, Settings, Languages, Sparkles, FolderHeart, Palette, Tag } from 'lucide-react';
 import { translateSegments, classifySegments, expandPromptWithGemini } from './services/geminiService';
 import { dictionaryService } from './services/dictionaryService';
 import { PromptTag, CategoryDef, DEFAULT_CATEGORIES, SyntaxType, AIConfig, DEFAULT_AI_CONFIG, ShortcutConfig, DEFAULT_SHORTCUTS, COLOR_PALETTE, DictionaryEntry } from './types';
@@ -9,21 +9,9 @@ import CategorySettings from './components/CategorySettings';
 import CollectionSidebar from './components/CollectionSidebar';
 import AddToCollectionModal from './components/AddToCollectionModal';
 import AIExpansionModal from './components/AIExpansionModal';
-import { useHistory } from './hooks/useHistory';
 
 const App: React.FC = () => {
-  // --- HISTORY MANAGEMENT ---
-  const { 
-      state: input, 
-      set: setInput, // Debounced set (for typing)
-      push: pushHistory, // Immediate set (for actions)
-      undo, 
-      redo,
-      canUndo,
-      canRedo,
-      clear: clearHistory
-  } = useHistory('');
-
+  const [input, setInput] = useState<string>('');
   const [tags, setTags] = useState<PromptTag[]>([]);
   const [copied, setCopied] = useState<boolean>(false);
   
@@ -299,14 +287,12 @@ const App: React.FC = () => {
 
      const newText = prefix + syntaxStart + suggestion.key + suffix;
      
-     // Auto-complete counts as typing, but distinct enough we might want to push to history immediately?
-     // Let's treat it as typing (debounced) to allow rapid corrections
-     const newCaretPos = prefix.length + syntaxStart.length + suggestion.key.length;
-     setInput(newText, newCaretPos, newCaretPos);
-     
+     setInput(newText);
      setSuggestions([]);
      setSuggestionPos(null);
 
+     const newCaretPos = prefix.length + syntaxStart.length + suggestion.key.length;
+     
      requestAnimationFrame(() => {
          if (textareaRef.current) {
              textareaRef.current.selectionStart = newCaretPos;
@@ -323,7 +309,7 @@ const App: React.FC = () => {
       const el = textareaRef.current;
       if (!el) {
           const newInput = input + (input ? ', ' : '') + textToInsert;
-          pushHistory(newInput, newInput.length, newInput.length);
+          setInput(newInput);
           setTimeout(() => processInput(newInput), 100);
           return;
       }
@@ -342,10 +328,9 @@ const App: React.FC = () => {
       }
 
       const newText = prefix + insertStr + suffix;
-      const newCaretPos = prefix.length + insertStr.length;
+      setInput(newText);
       
-      // Use pushHistory for immediate snapshot
-      pushHistory(newText, newCaretPos, newCaretPos);
+      const newCaretPos = prefix.length + insertStr.length;
       
       requestAnimationFrame(() => {
           if (textareaRef.current) {
@@ -382,11 +367,10 @@ const App: React.FC = () => {
             }
             
             const updatedInput = prefix + finalTextToInsert + suffix;
+            setInput(updatedInput);
+            
+            // Move caret to end of inserted text
             const newCaretPos = prefix.length + finalTextToInsert.length;
-            
-            // Push to history immediately
-            pushHistory(updatedInput, newCaretPos, newCaretPos);
-            
              requestAnimationFrame(() => {
                 if (textareaRef.current) {
                     textareaRef.current.selectionStart = newCaretPos;
@@ -482,6 +466,7 @@ const App: React.FC = () => {
       const uniqueMissing = Array.from(new Set(missingSegments));
       
       try {
+        // Use the new translateSegments function which ONLY does translation
         const results = await translateSegments(uniqueMissing, aiConfig);
 
         // RACE CONDITION FIX:
@@ -491,9 +476,11 @@ const App: React.FC = () => {
 
         const updatedTags = [...newTags];
         const replacements = new Map<number, string>(); // index -> new text
+        let needsCursorAdjustment = false;
         let cursorAdjustment = 0;
 
         results.forEach(res => {
+          // Update Cache
           const tagData = {
             originalText: res.originalText,
             englishText: res.englishText,
@@ -512,17 +499,29 @@ const App: React.FC = () => {
         if (isInputChinese) {
              missingSegmentIndices.forEach(index => {
                 const rawSeg = rawSegments[index];
+                // Find result for this segment
                 const res = results.find(r => r.originalText === rawSeg);
                 if (res && res.translation === res.raw) {
+                    // This means result is Chinese (translation == raw).
+                    // BUT our input was English (otherwise we wouldn't be translating to Chinese in this logic branch typically, 
+                    // unless mixed input. Let's rely on translateSegments behavior).
+                    
+                    // Actually, translateSegments sets 'raw' to the result of translation if we need to swap?
+                    // No, translateSegments returns 'englishText' and 'translation'.
+                    // If we are in Chinese Mode, we want the input text to be Chinese.
+                    
                     if (res.translation !== rawSeg) {
+                        // Translation is different from input, so we should update input to be translation
                         replacements.set(index, res.translation);
+                        
+                        // Also update cache for the NEW Chinese key
                         const newTagData = {
                             originalText: res.originalText,
                             englishText: res.englishText,
                             translation: res.translation,
                             category: '其他',
                             syntaxType: res.syntaxType,
-                            raw: res.translation,
+                            raw: res.translation, // The new raw is the Chinese text
                             disabled: false,
                             isRefreshing: false
                         };
@@ -534,6 +533,19 @@ const App: React.FC = () => {
 
         // Apply input replacements if any
         if (replacements.size > 0 && textareaRef.current) {
+            let newInput = currentInput;
+            const sortedIndices = Array.from(replacements.keys()).sort((a, b) => b - a); // Replace from end to start
+            
+            // Re-split to find exact ranges
+            // This is tricky because splitting by regex loses exact delimiter positions if we are not careful.
+            // A safer way is to reconstruct.
+            
+            // Let's use a simpler approach: Reconstruct the whole string from segments + delimiters? 
+            // Hard because splitInputToSegments consumes delimiters.
+            
+            // Alternative: We wait for user to stop typing? No, this is onProgress/completion.
+            
+            // Let's iterate and replace.
             const parts = currentInput.split(/([,，\n]+)/);
             let segIdx = 0;
             let currentPos = 0;
@@ -562,19 +574,25 @@ const App: React.FC = () => {
             
             const finalInput = newParts.join('');
             if (finalInput !== currentInput) {
-                // IMPORTANT: Use setInput (debounced) or pushHistory (immediate)
-                // Since this is an automatic update, pushHistory might clutter.
-                // But it is a distinct state change. Let's use setInput to treat it like typing.
-                const newCursor = oldSelectionStart + cursorAdjustment;
-                setInput(finalInput, newCursor, newCursor);
+                setInput(finalInput);
+                latestInputRef.current = finalInput;
+                needsCursorAdjustment = true;
+                
+                // We need to re-run processInput on the new input, but we can do it locally
+                // For now, let's just trigger setInput and let the effect chain handle it?
+                // Better to update tags immediately to avoid flicker.
+                
+                // Actually, let's skip tag update here and let the `useEffect` on `input` trigger `processInput` again.
+                // It will hit cache for the new chinese keys we just set.
                 
                 requestAnimationFrame(() => {
                     if (textareaRef.current) {
+                        const newCursor = oldSelectionStart + cursorAdjustment;
                         textareaRef.current.selectionStart = newCursor;
                         textareaRef.current.selectionEnd = newCursor;
                     }
                 });
-                return;
+                return; // Exit here, let the new input trigger processInput
             }
         }
 
@@ -601,7 +619,7 @@ const App: React.FC = () => {
         }
       }
     }
-  }, [categories, aiConfig, isInputChinese, setInput]);
+  }, [categories, aiConfig, isInputChinese]); // Added isInputChinese dependency
 
   // --- Auto Classify Handler ---
   const handleAutoClassify = async () => {
@@ -619,8 +637,12 @@ const App: React.FC = () => {
 
     try {
         const uniqueToClassify: string[] = Array.from(new Set(unclassifiedTags.map(t => t.englishText)));
+        
+        // Prepare simplified objects for the service
         const objectsToClassify = uniqueToClassify.map(text => ({ englishText: text }));
+        
         const categoriesResult = await classifySegments(objectsToClassify, categories, aiConfig);
+
         const categoryMap = new Map<string, string>();
         uniqueToClassify.forEach((text, i) => {
             categoryMap.set(text, categoriesResult[i]);
@@ -631,12 +653,17 @@ const App: React.FC = () => {
             const updated = prev.map(t => {
                 if (t.isRefreshing && categoryMap.has(t.englishText)) {
                     const newCat = categoryMap.get(t.englishText)!;
+                    
+                    // Update cache as well
                     const cached = tagCache.current.get(t.raw);
                     if (cached) {
                         const newCached = { ...cached, category: newCat };
                         tagCache.current.set(t.raw, newCached);
+                        
+                        // Learn valid classifications
                         dictionaryService.learn({ ...newCached, id: 'temp' });
                     }
+
                     return { ...t, category: newCat, isRefreshing: false };
                 }
                 if (t.isRefreshing) return { ...t, isRefreshing: false }; // Failed or skipped
@@ -657,11 +684,9 @@ const App: React.FC = () => {
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const val = e.target.value;
-      const caret = e.target.selectionStart;
+      setInput(val);
       
-      // Update via History Hook (Debounced)
-      setInput(val, caret, e.target.selectionEnd);
-      
+      // Only show suggestions if NOT pasting
       if (!isPasting.current) {
           updateSuggestions(val);
       } else {
@@ -689,45 +714,59 @@ const App: React.FC = () => {
          // Safety check: if tags are out of sync or refreshing, keep original text
          if (!currentTag || currentTag.isRefreshing) return part;
 
+         // Check if we have the target data
          const hasTranslation = currentTag.translation && currentTag.translation !== '...';
          const hasEnglish = currentTag.englishText;
 
          if (nextIsChinese && !hasTranslation) return part;
          if (!nextIsChinese && !hasEnglish) return part;
 
+         // Determine target text
+         // If switching to Chinese, use translation. If switching to English, use englishText.
          const targetText = nextIsChinese ? currentTag.translation : currentTag.englishText;
          
+         // Preserve leading/trailing whitespace of the segment
          const match = part.match(/^(\s*)(.*?)(\s*)$/);
          const prefix = match ? match[1] : '';
          const suffix = match ? match[3] : '';
          
+         // Pre-fill cache for the NEW text (targetText)
+         // This ensures that when processInput runs on the new text, it finds the data immediately.
          const newCacheData = {
              ...currentTag,
              raw: targetText, 
+             // IMPORTANT: We preserve the semantic data regardless of display language
+             // When displaying Chinese (raw=translation), englishText remains "1girl".
+             // When displaying English (raw=englishText), translation remains "1个女孩".
          };
          
          cacheUpdates.set(targetText, newCacheData);
+
          return prefix + targetText + suffix;
     });
 
+    // Apply cache updates synchronously
     cacheUpdates.forEach((val, key) => {
         tagCache.current.set(key, val);
     });
 
     const newInput = newParts.join('');
     
-    // IMPORTANT: Treat language toggle as a distinct action -> Push history
-    pushHistory(newInput, textareaRef.current?.selectionStart || 0, textareaRef.current?.selectionEnd || 0);
-
+    // Update ref immediately to prevent race condition logic in processInput from blocking this
+    latestInputRef.current = newInput;
+    
+    setInput(newInput);
     setIsInputChinese(nextIsChinese);
+    
+    // processInput will be triggered by useEffect, and it will hit the cache we just populated.
   };
 
   const handlePaste = () => {
       isPasting.current = true;
+      // Reset paste flag after a short delay
       setTimeout(() => { isPasting.current = false; }, 100);
   };
 
-  // Re-trigger analysis when input changes (controlled by History hook)
   useEffect(() => {
     if (isUpdatingFromTags.current) {
       isUpdatingFromTags.current = false;
@@ -743,6 +782,7 @@ const App: React.FC = () => {
   const handleRemoveTag = (id: string) => {
     const tagToRemove = tags.find(t => t.id === id);
     if (tagToRemove) {
+        // Reset disabled status in cache immediately
         const cached = tagCache.current.get(tagToRemove.raw);
         if (cached) {
             tagCache.current.set(tagToRemove.raw, { ...cached, disabled: false });
@@ -750,48 +790,45 @@ const App: React.FC = () => {
     }
     
     const newTags = tags.filter(t => t.id !== id);
-    // Don't just setTags, update Input which drives everything
+    setTags(newTags);
     updateInputFromTags(newTags);
+    // processInput will run due to input change and update prevTagsRef
   };
 
   const handleToggleTag = (tag: PromptTag) => {
     const newStatus = !tag.disabled;
-    
-    // We update cache first
-    const cached = tagCache.current.get(tag.raw);
-    if (cached) {
-      tagCache.current.set(tag.raw, { ...cached, disabled: newStatus });
-    }
-    
-    // Instead of setTags, we force a re-render of tags by updating the logic via processInput?
-    // Actually, processInput uses the cache. So if we just trigger a refresh of tags it works.
     setTags(prev => {
         const updated = prev.map(t => t.id === tag.id ? { ...t, disabled: newStatus } : t);
         prevTagsRef.current = updated;
         return updated;
     });
-    
-    // NOTE: This toggle is visual/logic only, it doesn't change the TEXT input.
-    // However, if we want this state change to be undoable via Ctrl+Z, it's tricky because history tracks TEXT.
-    // Our 'useHistory' tracks text. If 'disabled' state is not encoded in text (like with comments // or #),
-    // then text-based undo won't revert the 'disabled' status unless we treat disabled as text mutation.
-    //
-    // Current app logic: 'disabled' is meta-data in cache. 
-    // To make it undoable, we would need to snapshot the `tagCache` or similar.
-    //
-    // OPTION: We can skip history for simple toggle if it doesn't change text.
-    // BUT user asked for "Ctrl+/ undo".
-    // Let's see how Ctrl+/ is implemented below.
+    const cached = tagCache.current.get(tag.raw);
+    if (cached) {
+      tagCache.current.set(tag.raw, { ...cached, disabled: newStatus });
+    }
   };
 
   const handleReloadTag = async (tagToReload: PromptTag) => {
+    // For reload, we use the pure translation logic again (or we could enable full AI if desired)
+    // Based on user request "Translation completely via Baidu", let's stick to translateSegments.
     setTags(prev => prev.map(t => t.id === tagToReload.id ? { ...t, isRefreshing: true } : t));
     tagCache.current.delete(tagToReload.raw);
+
     try {
       const [result] = await translateSegments([tagToReload.raw], aiConfig);
+      
       if (result) {
-        const newData = { ...result, disabled: tagToReload.disabled, category: '其他' };
+        const newData = {
+            originalText: result.originalText,
+            englishText: result.englishText,
+            translation: result.translation,
+            category: '其他', // Reset category on reload, or keep previous? Resetting is safer.
+            syntaxType: result.syntaxType,
+            raw: result.raw,
+            disabled: tagToReload.disabled
+        };
         tagCache.current.set(result.raw, newData);
+        
         setTags(prev => {
             const updated = prev.map(t => t.id === tagToReload.id ? { ...newData, id: t.id, isRefreshing: false } : t);
             prevTagsRef.current = updated;
@@ -831,14 +868,11 @@ const App: React.FC = () => {
   const updateInputFromTags = (currentTags: PromptTag[]) => {
     isUpdatingFromTags.current = true;
     const newString = currentTags.map(t => t.raw).join(', ');
-    
-    // This usually happens after Drag or Delete
-    // Treat as significant action -> pushHistory
-    pushHistory(newString);
+    setInput(newString);
   };
 
   const handleClear = () => {
-    clearHistory();
+    setInput('');
     setTags([]);
     prevTagsRef.current = [];
     setSuggestions([]);
@@ -864,6 +898,7 @@ const App: React.FC = () => {
       backdropRef.current.scrollTop = e.currentTarget.scrollTop;
       backdropRef.current.scrollLeft = e.currentTarget.scrollLeft;
     }
+    // Hide suggestions on scroll as position might become invalid
     setSuggestions([]); 
   };
 
@@ -896,55 +931,7 @@ const App: React.FC = () => {
     return ranges;
   };
 
-  // --- UNDO / REDO KEY HANDLER ---
-  const handleUndoRedo = useCallback((e: React.KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-          e.preventDefault();
-          if (e.shiftKey) {
-             // Redo
-             const nextState = redo();
-             if (nextState && textareaRef.current) {
-                // Restore Cursor
-                requestAnimationFrame(() => {
-                    if (textareaRef.current) {
-                        textareaRef.current.selectionStart = nextState.selectionStart;
-                        textareaRef.current.selectionEnd = nextState.selectionEnd;
-                    }
-                });
-             }
-          } else {
-             // Undo
-             const prevState = undo();
-             if (prevState && textareaRef.current) {
-                // Restore Cursor
-                requestAnimationFrame(() => {
-                    if (textareaRef.current) {
-                        textareaRef.current.selectionStart = prevState.selectionStart;
-                        textareaRef.current.selectionEnd = prevState.selectionEnd;
-                    }
-                });
-             }
-          }
-      }
-      // Win/Linux Y for Redo
-      if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
-          e.preventDefault();
-          const nextState = redo();
-           if (nextState && textareaRef.current) {
-                requestAnimationFrame(() => {
-                    if (textareaRef.current) {
-                        textareaRef.current.selectionStart = nextState.selectionStart;
-                        textareaRef.current.selectionEnd = nextState.selectionEnd;
-                    }
-                });
-             }
-      }
-  }, [undo, redo]);
-
   const handleTextAreaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // 0. Handle Undo/Redo
-    handleUndoRedo(e);
-
     const isModifier = e.ctrlKey || e.metaKey;
     
     // --- Autocomplete Navigation ---
@@ -997,22 +984,7 @@ const App: React.FC = () => {
         }
         
         if (idsToToggle.size > 0) {
-            // Toggle Logic
             const newTags = tags.map(t => idsToToggle.has(t.id) ? { ...t, disabled: !t.disabled } : t);
-            
-            // To make "Disable" undoable in text history, we assume disabled status is visual only.
-            // If user wants to "undo" the visual toggle, we need to track it separately or map it to text.
-            // Current implementation: Disabled is cache-state only, not text state.
-            // 
-            // If you want Ctrl+Z to undo disable toggle, we must implement history for `tags` or `tagCache`.
-            // However, the prompt specifically asked about "Undo not working for AI/Collection/Ctrl+/".
-            // Since `Ctrl+/` changes the VISUAL state, not the TEXT state in this app architecture,
-            // standard text undo won't revert it unless we store that metadata in history.
-            //
-            // Given constraints, I will ensure `useHistory` handles the text changes perfectly. 
-            // `Ctrl+/` toggles `disabled` property in the `tagCache`. 
-            // To undo this, we would need a Command pattern or state history for the tags array.
-            
             setTags(newTags);
             prevTagsRef.current = newTags;
             // Update cache
@@ -1031,19 +1003,36 @@ const App: React.FC = () => {
         const textarea = e.currentTarget;
         const start = textarea.selectionStart;
         const end = textarea.selectionEnd;
+        const ranges = getTagRanges(input);
         
-        let textToSave = '';
-        if (start !== end) {
+        const selectedTexts: string[] = [];
+        const seenIds = new Set<string>();
+
+        // Find overlapping tags with current selection
+        ranges.forEach(r => {
+             const isOverlap = (start === end) 
+                ? (start >= r.start && start <= r.end)
+                : (r.start < end && r.end > start);
+             
+             if (isOverlap && tags[r.index]) {
+                 if (!seenIds.has(tags[r.index].id)) {
+                     selectedTexts.push(tags[r.index].raw);
+                     seenIds.add(tags[r.index].id);
+                 }
+             }
+        });
+        
+        let textToSave = selectedTexts.join(', ');
+        
+        // Fallback: if no tags identified, use raw text selection
+        if (!textToSave && start !== end) {
             textToSave = input.substring(start, end);
-        } else {
-             // Try to grab all tags
-             textToSave = tags.map(t => t.raw).join(', ');
         }
 
         if (textToSave) {
             setAddToCollectionData(textToSave);
             setShowAddToCollectionModal(true);
-            setIsCollectionOpen(true); 
+            setIsCollectionOpen(true); // Open collection popover to show context
         }
     }
 
@@ -1108,10 +1097,13 @@ const App: React.FC = () => {
         }
 
         const innerContent = (() => {
+           // If category highlighting is enabled, we skip the specific syntax coloring 
+           // and simply render the text so it inherits the parent's category color.
            if (enableHighlighting) {
                return part;
            }
 
+           // Default Syntax highlighting logic
            const regex = /(\<[^>]+?\>|\{[^}]+?\}|\([^)]+?\)|\[[^\]]+?\])/g;
            const subParts = part.split(regex);
            
@@ -1298,45 +1290,9 @@ const App: React.FC = () => {
                     </button>
                 </div>
             </div>
-            <div className="flex items-center gap-2">
-                <div className="flex items-center bg-gray-800/50 rounded-lg p-0.5 border border-gray-700/50">
-                     <button 
-                        onClick={() => {
-                            const prev = undo();
-                            if (prev && textareaRef.current) {
-                                requestAnimationFrame(() => {
-                                    if(textareaRef.current) {
-                                        textareaRef.current.selectionStart = prev.selectionStart;
-                                        textareaRef.current.selectionEnd = prev.selectionEnd;
-                                    }
-                                });
-                            }
-                        }}
-                        disabled={!canUndo}
-                        className={`p-1 rounded-md transition-colors ${canUndo ? 'text-gray-400 hover:text-white hover:bg-gray-700' : 'text-gray-700 cursor-not-allowed'}`}
-                        title="撤销 (Undo)"
-                     >
-                        <Undo2 size={14} />
-                     </button>
-                     <button 
-                        onClick={() => {
-                            const next = redo();
-                            if (next && textareaRef.current) {
-                                requestAnimationFrame(() => {
-                                    if(textareaRef.current) {
-                                        textareaRef.current.selectionStart = next.selectionStart;
-                                        textareaRef.current.selectionEnd = next.selectionEnd;
-                                    }
-                                });
-                            }
-                        }}
-                        disabled={!canRedo}
-                        className={`p-1 rounded-md transition-colors ${canRedo ? 'text-gray-400 hover:text-white hover:bg-gray-700' : 'text-gray-700 cursor-not-allowed'}`}
-                        title="重做 (Redo)"
-                     >
-                        <Redo2 size={14} />
-                     </button>
-                </div>
+            <div className="text-[10px] text-gray-500 flex items-center gap-1 bg-gray-900 px-2 py-1 rounded-full border border-gray-800">
+              <Info size={10} />
+              {isInteractionMode ? '交互模式: 悬浮查看详情' : `Ctrl+J 收藏 · Ctrl+L AI扩写`}
             </div>
           </div>
           
